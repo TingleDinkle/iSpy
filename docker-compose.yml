@@ -1,0 +1,57 @@
+# iSpy stack: PostgreSQL + Metabase dashboard + the job runner.
+#
+#   docker compose up -d db metabase          # start the database + dashboard
+#   docker compose run --rm jobs python manage.py init-db
+#   docker compose run --rm jobs python daily_snapshot.py
+#
+# Postgres is published on HOST port 5433 (5432 is often taken by a local
+# install). From the host, use:
+#   DATABASE_URL=postgresql+psycopg://tracker:tracker@localhost:5433/appstore_tracker
+# Inside the compose network the jobs container reaches it as db:5432.
+# Metabase: http://localhost:3000 (first run walks you through setup —
+# point it at host "db", port 5432, database appstore_tracker).
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+      POSTGRES_DB: appstore_tracker
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d appstore_tracker"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  metabase:
+    image: metabase/metabase:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  jobs:
+    build: .
+    profiles: ["jobs"]          # never autostarts; use `docker compose run --rm jobs ...`
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://tracker:tracker@db:5432/appstore_tracker
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  metabase-data:

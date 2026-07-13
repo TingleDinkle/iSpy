@@ -1,0 +1,380 @@
+"""Daily snapshot job: pull metadata, estimates, installs, and reviews for
+every active tracked app and upsert them into PostgreSQL.
+
+Idempotent — safe to re-run for the same day (upserts throughout). Failures
+are isolated per app/stage so one bad app never sinks the whole run; the exit
+code is non-zero if anything failed.
+
+Usage:
+    python daily_snapshot.py                     # everything, both stores
+    python daily_snapshot.py --store ios         # one store only
+    python daily_snapshot.py --skip-reviews      # metrics only
+    python daily_snapshot.py --skip-estimates --skip-installs
+
+Schedule daily via cron / Windows Task Scheduler after midnight UTC.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import logging
+import sys
+
+from sqlalchemy import func, select
+
+from tracker.api_client import (
+    AppstoreSpyClient,
+    AppstoreSpyError,
+    AuthenticationError,
+    CreditBudgetExhausted,
+)
+from tracker import utf8_console
+from tracker.config import settings
+from tracker.db import SessionLocal, session_scope
+from tracker.events import looks_like_soft_launch
+from tracker.ingest import (
+    insert_event,
+    insert_reviews,
+    refresh_app_metadata,
+    sync_developer_apps,
+    upsert_daily_installs,
+    upsert_monthly_estimates,
+    upsert_rankings,
+    upsert_snapshot,
+)
+from tracker.models import (
+    App,
+    AppSnapshot,
+    DailyInstalls,
+    Developer,
+    DeveloperApp,
+    RankingWatch,
+    STORE_IOS,
+    STORE_PLAY,
+    TIER_PRIMARY,
+    TIER_WATCH,
+)
+
+log = logging.getLogger("daily_snapshot")
+
+APP_DETAIL_FIELDS = (
+    "id", "bundle", "name", "category", "developer_id", "developer_name",
+    "rating_value", "rating_count", "revenue", "downloads", "version",
+    "released", "updated", "removed",
+    # intelligence fields diffed by detect_events.py:
+    "whatsnew", "icon", "screenshots", "countries_list", "advertised",
+)
+
+
+def snapshot_app_details(client: AppstoreSpyClient, app: App, today: dt.date) -> bool:
+    """Fetch app details and store today's snapshot. True on success."""
+    payload = client.get_app(app.store, app.store_app_id, country=app.country,
+                             fields=APP_DETAIL_FIELDS)
+    if payload is None:
+        log.warning("%s:%s has no data yet (queued for crawl?) — skipped",
+                    app.store, app.store_app_id)
+        return False
+    with session_scope() as session:
+        db_app = session.get(App, app.id)
+        refresh_app_metadata(db_app, payload)
+        upsert_snapshot(session, db_app, payload, today)
+    return True
+
+
+def snapshot_estimates(client: AppstoreSpyClient, apps: list[App], today: dt.date) -> int:
+    """Batched monthly estimates for all apps of one store. Returns rows written."""
+    if not apps:
+        return 0
+    store = apps[0].store
+    start = today - dt.timedelta(days=settings.estimates_lookback_days)
+    rows = client.get_estimates(store, [a.store_app_id for a in apps], start=start, end=today)
+    id_map = {a.store_app_id: a.id for a in apps}
+    with session_scope() as session:
+        return upsert_monthly_estimates(session, id_map, rows)
+
+
+def snapshot_daily_installs(client: AppstoreSpyClient, app: App, today: dt.date) -> int:
+    """Play-only daily installs, resuming from the last stored date."""
+    with SessionLocal() as session:
+        last = session.execute(
+            select(func.max(DailyInstalls.date)).where(DailyInstalls.app_id == app.id)
+        ).scalar_one()
+    if last is None:
+        start = today - dt.timedelta(days=settings.installs_lookback_days)
+    else:
+        # Re-pull a few trailing days: upstream revises recent values.
+        start = last - dt.timedelta(days=settings.installs_refetch_days)
+    rows = client.get_daily_installs(app.store_app_id, start=start, end=today)
+    with session_scope() as session:
+        db_app = session.get(App, app.id)
+        return upsert_daily_installs(session, db_app, rows)
+
+
+def snapshot_reviews(client: AppstoreSpyClient, app: App) -> int:
+    rows = client.get_reviews(app.store, app.store_app_id, country=app.country)
+    with session_scope() as session:
+        db_app = session.get(App, app.id)
+        return insert_reviews(session, db_app, rows)
+
+
+def snapshot_rankings(client: AppstoreSpyClient, watch: RankingWatch,
+                      today: dt.date) -> int:
+    """Pull the last few days of one watched chart (all collections)."""
+    start = today - dt.timedelta(days=settings.rankings_lookback_days)
+    rows = client.get_rankings(watch.store, watch.country, watch.category,
+                               date_start=start, date_end=today,
+                               rank_end=watch.rank_depth)
+    with session_scope() as session:
+        return upsert_rankings(session, watch.store, rows)
+
+
+def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
+                            today: dt.date) -> tuple[int, int]:
+    """Re-query a studio's portfolio; new apps become events (new-game radar).
+
+    Returns (new_apps, events_created). The first sync for a developer seeds
+    the baseline silently. New apps get one extra details call to check for a
+    soft launch and, when auto_track is on, join the registry as 'watch' tier.
+    """
+    rows = client.query_apps(
+        dev.store, {"developer_id": dev.store_dev_id},
+        fields=["id", "name", "release_date"], sort="-release_date", limit=200,
+    )
+    with session_scope() as session:
+        known_before = session.execute(
+            select(func.count()).select_from(DeveloperApp)
+            .where(DeveloperApp.developer_id == dev.id)
+        ).scalar_one()
+        db_dev = session.get(Developer, dev.id)
+        new_apps = sync_developer_apps(session, db_dev, rows, today)
+        new_specs = [(a.store_app_id, a.name) for a in new_apps]
+
+    if known_before == 0:
+        log.info("%s (%s): baseline of %d app(s) recorded", dev.name, dev.store,
+                 len(new_specs))
+        return len(new_specs), 0
+
+    events = 0
+    for store_app_id, name in new_specs:
+        label = name or store_app_id
+        details = None
+        try:
+            details = client.get_app(dev.store, store_app_id,
+                                     fields=("id", "name", "released",
+                                             "countries_list", "version"))
+        except AppstoreSpyError as exc:
+            log.warning("details for new app %s failed: %s", store_app_id, exc)
+
+        countries = (details or {}).get("countries_list")
+        with session_scope() as session:
+            if insert_event(
+                session,
+                event_type="new_developer_app",
+                event_date=today,
+                title=f"{dev.name or dev.store_dev_id} has a new game: {label} ({dev.store})",
+                details={"developer": dev.name, "app": store_app_id,
+                         "countries": countries},
+                dedupe_key=f"new_developer_app|{dev.store}|{store_app_id}",
+                store=dev.store, store_app_id=store_app_id,
+            ):
+                events += 1
+            if countries and looks_like_soft_launch(countries):
+                if insert_event(
+                    session,
+                    event_type="soft_launch_detected",
+                    event_date=today,
+                    title=(f"Possible SOFT LAUNCH: {label} by "
+                           f"{dev.name or dev.store_dev_id} is live in only "
+                           f"{len(countries)} market(s): {', '.join(sorted(countries)[:8])}"),
+                    details={"countries": sorted(countries), "app": store_app_id},
+                    dedupe_key=f"soft_launch_detected|{dev.store}|{store_app_id}",
+                    store=dev.store, store_app_id=store_app_id,
+                ):
+                    events += 1
+            if dev.auto_track:
+                exists = session.execute(
+                    select(App).where(App.store == dev.store,
+                                      App.store_app_id == store_app_id)
+                ).scalar_one_or_none()
+                if exists is None:
+                    session.add(App(store=dev.store, store_app_id=store_app_id,
+                                    name=name, tier=TIER_WATCH,
+                                    country=settings.default_country))
+                    log.info("auto-tracking new app %s (%s) as watch tier",
+                             label, dev.store)
+    return len(new_specs), events
+
+
+def main() -> int:
+    utf8_console()
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--store", choices=[STORE_IOS, STORE_PLAY],
+                        help="limit to one store")
+    parser.add_argument("--tier", choices=[TIER_PRIMARY, TIER_WATCH, "all"],
+                        default=None,
+                        help="force a tier (default: primary daily, watch when stale)")
+    parser.add_argument("--skip-reviews", action="store_true")
+    parser.add_argument("--skip-estimates", action="store_true")
+    parser.add_argument("--skip-installs", action="store_true")
+    parser.add_argument("--skip-rankings", action="store_true")
+    parser.add_argument("--skip-developers", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+    today = dt.datetime.now(dt.timezone.utc).date()
+
+    with SessionLocal() as session:
+        query = select(App).where(App.is_active.is_(True)).order_by(App.store, App.id)
+        if args.store:
+            query = query.where(App.store == args.store)
+        all_apps = list(session.execute(query).scalars())
+        last_snapshot = dict(session.execute(
+            select(AppSnapshot.app_id, func.max(AppSnapshot.snapshot_date))
+            .group_by(AppSnapshot.app_id)
+        ).all())
+
+    # Tier scheduling: primary apps every run; watch apps only when their
+    # last snapshot is at least watch_refresh_days old (self-healing, so a
+    # missed cron day doesn't skip a week).
+    def is_due(app: App) -> bool:
+        if args.tier == "all":
+            return True
+        if args.tier is not None:
+            return app.tier == args.tier
+        if app.tier == TIER_PRIMARY:
+            return True
+        last = last_snapshot.get(app.id)
+        return last is None or (today - last).days >= settings.watch_refresh_days
+
+    apps = [a for a in all_apps if is_due(a)]
+    skipped_watch = len(all_apps) - len(apps)
+
+    if not apps and args.skip_rankings and args.skip_developers:
+        log.error("Nothing to do. Add apps: python manage.py add-app <store> <id>")
+        return 1
+
+    log.info("Snapshotting %d app(s) for %s (%d watch-tier not due yet)",
+             len(apps), today, skipped_watch)
+    client = AppstoreSpyClient()
+    failures: list[str] = []
+    stats = {"snapshots": 0, "estimate_rows": 0, "install_rows": 0,
+             "new_reviews": 0, "ranking_rows": 0, "new_dev_apps": 0, "events": 0}
+
+    try:
+        # Per-app details + reviews + (Play) daily installs
+        for app in apps:
+            label = f"{app.store}:{app.store_app_id}"
+            try:
+                if snapshot_app_details(client, app, today):
+                    stats["snapshots"] += 1
+            except (AuthenticationError, CreditBudgetExhausted):
+                raise  # fatal for the whole run — handled by the outer handlers
+            except AppstoreSpyError as exc:
+                failures.append(f"{label} details: {exc}")
+                log.error("%s details failed: %s", label, exc)
+
+            # installs and reviews are primary-tier only: they cost a credit
+            # per app per day and watch apps only need the metric trail
+            if (app.store == STORE_PLAY and not args.skip_installs
+                    and app.tier == TIER_PRIMARY):
+                try:
+                    stats["install_rows"] += snapshot_daily_installs(client, app, today)
+                except (AuthenticationError, CreditBudgetExhausted):
+                    raise
+                except AppstoreSpyError as exc:
+                    failures.append(f"{label} installs: {exc}")
+                    log.error("%s installs failed: %s", label, exc)
+
+            if not args.skip_reviews and app.tier == TIER_PRIMARY:
+                try:
+                    stats["new_reviews"] += snapshot_reviews(client, app)
+                except (AuthenticationError, CreditBudgetExhausted):
+                    raise
+                except AppstoreSpyError as exc:
+                    failures.append(f"{label} reviews: {exc}")
+                    log.error("%s reviews failed: %s", label, exc)
+
+        # Batched monthly estimates, once per store
+        if not args.skip_estimates:
+            for store in (STORE_IOS, STORE_PLAY):
+                store_apps = [a for a in apps if a.store == store]
+                if not store_apps:
+                    continue
+                try:
+                    stats["estimate_rows"] += snapshot_estimates(client, store_apps, today)
+                except (AuthenticationError, CreditBudgetExhausted):
+                    raise
+                except AppstoreSpyError as exc:
+                    failures.append(f"{store} estimates: {exc}")
+                    log.error("%s estimates failed: %s", store, exc)
+
+        # Top-chart rankings for every watched category chart
+        if not args.skip_rankings:
+            with SessionLocal() as session:
+                watch_query = select(RankingWatch).where(RankingWatch.is_active.is_(True))
+                if args.store:
+                    watch_query = watch_query.where(RankingWatch.store == args.store)
+                watches = list(session.execute(watch_query).scalars())
+            for watch in watches:
+                chart = f"{watch.store}/{watch.country}/{watch.category}"
+                try:
+                    rows = snapshot_rankings(client, watch, today)
+                    stats["ranking_rows"] += rows
+                    log.info("rankings %s: %d rows", chart, rows)
+                except (AuthenticationError, CreditBudgetExhausted):
+                    raise
+                except AppstoreSpyError as exc:
+                    failures.append(f"rankings {chart}: {exc}")
+                    log.error("rankings %s failed: %s", chart, exc)
+
+        # Studio portfolios: the new-game radar
+        if not args.skip_developers:
+            with SessionLocal() as session:
+                dev_query = select(Developer).where(Developer.is_active.is_(True))
+                if args.store:
+                    dev_query = dev_query.where(Developer.store == args.store)
+                devs = list(session.execute(dev_query).scalars())
+            for dev in devs:
+                try:
+                    new_apps, events = discover_developer_apps(client, dev, today)
+                    stats["new_dev_apps"] += new_apps
+                    stats["events"] += events
+                except (AuthenticationError, CreditBudgetExhausted):
+                    raise
+                except AppstoreSpyError as exc:
+                    failures.append(f"developer {dev.name or dev.store_dev_id}: {exc}")
+                    log.error("developer %s failed: %s", dev.name, exc)
+
+    except AuthenticationError as exc:
+        log.critical("%s", exc)
+        return 2
+    except CreditBudgetExhausted as exc:
+        log.critical("Stopping run: %s", exc)
+        failures.append(str(exc))
+
+    log.info(
+        "Done. snapshots=%(snapshots)d estimate_rows=%(estimate_rows)d "
+        "install_rows=%(install_rows)d new_reviews=%(new_reviews)d "
+        "ranking_rows=%(ranking_rows)d new_dev_apps=%(new_dev_apps)d "
+        "events=%(events)d", stats,
+    )
+    log.info("Credits used this month: %d / %d",
+             client.ledger.used_this_month, client.ledger.budget)
+
+    if failures:
+        log.warning("%d failure(s):", len(failures))
+        for f in failures:
+            log.warning("  - %s", f)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
