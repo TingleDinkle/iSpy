@@ -21,13 +21,15 @@ import datetime as dt
 import logging
 import sys
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from tracker.api_client import (
     AppstoreSpyClient,
     AppstoreSpyError,
     AuthenticationError,
     CreditBudgetExhausted,
+    RequestFailed,
+    RetriesExhausted,
 )
 from tracker import utf8_console
 from tracker.config import settings
@@ -137,9 +139,11 @@ def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
     the baseline silently. New apps get one extra details call to check for a
     soft launch and, when auto_track is on, join the registry as 'watch' tier.
     """
-    rows = client.query_apps(
+    # Full portfolio, paginated: a single page truncates prolific publishers
+    # and later misreports their old titles as "new games".
+    rows = client.query_apps_all(
         dev.store, {"developer_id": dev.store_dev_id},
-        fields=["id", "name", "release_date"], sort="-release_date", limit=200,
+        fields=["id", "name", "release_date"], sort="-release_date",
     )
     with session_scope() as session:
         known_before = session.execute(
@@ -148,7 +152,7 @@ def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
         ).scalar_one()
         db_dev = session.get(Developer, dev.id)
         new_apps = sync_developer_apps(session, db_dev, rows, today)
-        new_specs = [(a.store_app_id, a.name) for a in new_apps]
+        new_specs = [(a.store_app_id, a.name, a.release_date) for a in new_apps]
 
     if known_before == 0:
         log.info("%s (%s): baseline of %d app(s) recorded", dev.name, dev.store,
@@ -156,15 +160,35 @@ def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
         return len(new_specs), 0
 
     events = 0
-    for store_app_id, name in new_specs:
+    for store_app_id, name, release_date in new_specs:
         label = name or store_app_id
+        # An "unseen" app released long ago is an upstream data correction
+        # sliding into view, not a new game — baseline it silently.
+        if release_date and (today - release_date).days > 365:
+            log.info("%s: %s released %s — recorded without a new-game event",
+                     dev.name, label, release_date)
+            continue
+
         details = None
+        retry_countries = False  # re-check tomorrow when data may still arrive
         try:
             details = client.get_app(dev.store, store_app_id,
                                      fields=("id", "name", "released",
                                              "countries_list", "version"))
-        except AppstoreSpyError as exc:
+            if details is None:
+                # 202/204 on the default (US) storefront — soft-launched
+                # titles usually have no US data, so try a test market.
+                details = client.get_app(dev.store, store_app_id, country="PH",
+                                         fields=("id", "name", "released",
+                                                 "countries_list", "version"))
+            retry_countries = details is None  # still queued for crawling
+        except RetriesExhausted as exc:
+            retry_countries = True  # transient — worth another attempt tomorrow
             log.warning("details for new app %s failed: %s", store_app_id, exc)
+        except RequestFailed as exc:
+            # deterministic 4xx — retrying daily would only burn credits;
+            # fatal errors (auth, credit budget) propagate to main()'s handlers
+            log.warning("details for new app %s rejected: %s", store_app_id, exc)
 
         countries = (details or {}).get("countries_list")
         with session_scope() as session:
@@ -203,6 +227,17 @@ def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
                                     country=settings.default_country))
                     log.info("auto-tracking new app %s (%s) as watch tier",
                              label, dev.store)
+            if countries is None and retry_countries:
+                # Not crawled yet (202/204) or transient failure: drop the
+                # baseline row so tomorrow's run re-checks for a soft launch.
+                # Events are deduped by key, so this produces no repeats.
+                session.execute(
+                    delete(DeveloperApp).where(
+                        DeveloperApp.developer_id == dev.id,
+                        DeveloperApp.store_app_id == store_app_id)
+                )
+                log.info("%s: countries unknown for %s — will re-check on the "
+                         "next run", dev.name, label)
     return len(new_specs), events
 
 

@@ -61,6 +61,11 @@ class TestDiffSnapshots:
         drafts = diff_snapshots(dict(BASE), curr, "G")
         assert types(drafts) == ["icon_change"]
 
+    def test_screenshots_reorder_only_is_not_an_event(self):
+        # CDN/A-B rotation reorders the same set — that's noise, not a change
+        curr = {**BASE, "screenshots": list(reversed(BASE["screenshots"]))}
+        assert diff_snapshots(dict(BASE), curr, "G") == []
+
     def test_screenshots_change_counts_delta(self):
         curr = {**BASE, "screenshots": ["https://cdn/s2.png", "https://cdn/s3.png",
                                         "https://cdn/s4.png"]}

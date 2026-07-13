@@ -182,7 +182,10 @@ class Review(Base):
     app_version: Mapped[Optional[str]] = mapped_column(String(64))
     likes: Mapped[Optional[int]] = mapped_column(Integer)       # Play only
     created_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    topics: Mapped[Optional[list[str]]] = mapped_column(JSONB)  # filled by analyze_reviews.py
+    # none_as_null: Python None must map to SQL NULL, not JSONB 'null' — the
+    # untagged-review filter is `topics IS NULL` and the weekly view calls
+    # jsonb_array_elements_text, which errors on a scalar 'null'.
+    topics: Mapped[Optional[list[str]]] = mapped_column(JSONB(none_as_null=True))
     raw: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
     fetched_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

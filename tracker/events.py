@@ -84,7 +84,8 @@ def diff_snapshots(
 
     prev_shots = prev_raw.get("screenshots") or []
     curr_shots = curr_raw.get("screenshots") or []
-    if prev_shots and curr_shots and prev_shots != curr_shots:
+    # compare as sets: order-only rotation is CDN noise, not a creative change
+    if prev_shots and curr_shots and set(prev_shots) != set(curr_shots):
         added = len(set(curr_shots) - set(prev_shots))
         removed = len(set(prev_shots) - set(curr_shots))
         drafts.append(EventDraft(

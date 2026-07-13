@@ -414,6 +414,29 @@ class AppstoreSpyClient:
             return []
         return data.get("data") or []
 
+    def query_apps_all(
+        self,
+        store: str,
+        filter_body: dict[str, Any],
+        fields: Optional[list[str]] = None,
+        sort: Optional[str] = None,
+        page_size: int = 200,
+        max_pages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """query_apps with pagination: fetches until a short page. Use for
+        full-portfolio pulls — a single page silently truncates prolific
+        publishers and later misreports old titles as new."""
+        results: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            rows = self.query_apps(store, filter_body, fields=fields, sort=sort,
+                                   limit=page_size, page=page)
+            results.extend(rows)
+            if len(rows) < page_size:
+                return results
+        log.warning("query_apps_all hit max_pages=%d for filter %s — portfolio "
+                    "may be truncated", max_pages, filter_body)
+        return results
+
     def get_summary(self, store: str, filter_body: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Aggregate market metrics for a filter (POST /{store}/apps/summary).
         Returns {"total", "ipd", "revenue", "downloads", "available", "removed"}.

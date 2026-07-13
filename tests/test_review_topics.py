@@ -4,8 +4,40 @@ from __future__ import annotations
 
 import pytest
 
+import datetime as dt
+
 from tracker.review_topics import TOPICS, classify, review_weight
-from analyze_reviews import weighted_avg_stars
+from analyze_reviews import bucket_for, weighted_avg_stars
+
+TODAY = dt.date(2026, 7, 13)
+UTC = dt.timezone.utc
+
+
+class TestWindowBuckets:
+    def test_windows_are_symmetric_seven_days(self):
+        # recent = (today-7, today], prior = (today-14, today-7]
+        assert bucket_for(dt.datetime(2026, 7, 13, 12, tzinfo=UTC), TODAY, 7) == "recent"
+        assert bucket_for(dt.datetime(2026, 7, 7, 0, 1, tzinfo=UTC), TODAY, 7) == "recent"
+        assert bucket_for(dt.datetime(2026, 7, 6, 23, 59, tzinfo=UTC), TODAY, 7) == "prior"
+        assert bucket_for(dt.datetime(2026, 6, 30, 0, 1, tzinfo=UTC), TODAY, 7) == "prior"
+        assert bucket_for(dt.datetime(2026, 6, 29, 23, 59, tzinfo=UTC), TODAY, 7) is None
+
+    def test_recent_and_prior_cover_equal_day_counts(self):
+        days = [TODAY - dt.timedelta(days=i) for i in range(0, 20)]
+        buckets = [bucket_for(dt.datetime.combine(d, dt.time(12), tzinfo=UTC), TODAY, 7)
+                   for d in days]
+        assert buckets.count("recent") == 7
+        assert buckets.count("prior") == 7
+
+    def test_local_timezone_timestamp_normalized_to_utc(self):
+        # 23:30 on the boundary day in UTC+7 is 16:30 UTC the SAME day — but a
+        # naive .date() in local time would land it a day late.
+        bangkok = dt.timezone(dt.timedelta(hours=7))
+        ts = dt.datetime(2026, 7, 7, 5, 30, tzinfo=bangkok)  # = 2026-07-06 22:30 UTC
+        assert bucket_for(ts, TODAY, 7) == "prior"
+
+    def test_naive_timestamp_treated_as_utc(self):
+        assert bucket_for(dt.datetime(2026, 7, 13, 1, 0), TODAY, 7) == "recent"
 
 
 class TestClassify:

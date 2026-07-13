@@ -707,6 +707,22 @@ class TestNewEndpoints:
         client = make_client([FakeResponse(204)])
         assert client.query_apps("ios", {"developer_id": "1"}) == []
 
+    def test_query_apps_all_paginates_until_short_page(self, fake_time):
+        page1 = {"data": [{"id": str(i)} for i in range(3)]}
+        page2 = {"data": [{"id": "3"}]}
+        client = make_client([FakeResponse(200, page1), FakeResponse(200, page2)])
+        rows = client.query_apps_all("play", {"developer_id": "d"}, page_size=3)
+        assert [r["id"] for r in rows] == ["0", "1", "2", "3"]
+        assert [c["json"]["page"] for c in client._session.calls] == [1, 2]
+
+    def test_query_apps_all_stops_at_max_pages(self, fake_time):
+        full = {"data": [{"id": "x"}, {"id": "y"}]}
+        client = make_client([FakeResponse(200, full)] * 2)
+        rows = client.query_apps_all("play", {"developer_id": "d"},
+                                     page_size=2, max_pages=2)
+        assert len(rows) == 4
+        assert len(client._session.calls) == 2  # capped, no runaway
+
     def test_get_summary_posts_filter(self, fake_time):
         summary = {"total": 10, "revenue": 5, "downloads": 7,
                    "available": 3, "removed": 7, "ipd": 2}

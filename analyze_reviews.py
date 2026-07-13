@@ -22,7 +22,7 @@ import logging
 import sys
 from typing import Optional, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import null, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from tracker import utf8_console
@@ -58,6 +58,26 @@ def tag_reviews(batch_size: int = 2000) -> int:
     return tagged
 
 
+def bucket_for(created_at: dt.datetime, today: dt.date, window_days: int) -> Optional[str]:
+    """Assign a review to the 'recent' or 'prior' window (or None).
+
+    Both windows are exactly ``window_days`` calendar days in UTC:
+    recent = (today - w, today], prior = (today - 2w, today - w]. Timestamps
+    are normalised to UTC first — psycopg returns timestamptz in the
+    connection's local timezone, which would misbucket reviews near midnight.
+    """
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=dt.timezone.utc)
+    day = created_at.astimezone(dt.timezone.utc).date()
+    recent_cutoff = today - dt.timedelta(days=window_days)
+    prior_cutoff = today - dt.timedelta(days=2 * window_days)
+    if day > recent_cutoff:
+        return "recent"
+    if day > prior_cutoff:
+        return "prior"
+    return None
+
+
 def weighted_avg_stars(rows: Sequence[tuple[Optional[int], Optional[int]]]) -> Optional[float]:
     """rows = (stars, likes). Returns helpfulness-weighted mean, or None."""
     total_weight = 0.0
@@ -75,8 +95,7 @@ def detect_rating_drops(window_days: int, drop_threshold: float,
                         min_reviews: int, today: dt.date) -> int:
     """Compare weighted avg stars: last window vs the window before it."""
     created = 0
-    recent_start = today - dt.timedelta(days=window_days)
-    prior_start = today - dt.timedelta(days=2 * window_days)
+    prior_cutoff = today - dt.timedelta(days=2 * window_days)
 
     with SessionLocal() as session:
         apps = list(session.execute(select(App).where(App.is_active.is_(True))).scalars())
@@ -87,13 +106,15 @@ def detect_rating_drops(window_days: int, drop_threshold: float,
                 select(Review.stars, Review.likes, Review.created_at)
                 .where(Review.app_id == app.id,
                        Review.created_at.is_not(None),
-                       Review.created_at >= dt.datetime.combine(
-                           prior_start, dt.time.min, tzinfo=dt.timezone.utc))
+                       Review.created_at > dt.datetime.combine(
+                           prior_cutoff, dt.time.max, tzinfo=dt.timezone.utc))
             ))
-            recent = [(s, l) for s, l, created_at in rows
-                      if created_at.date() >= recent_start]
-            prior = [(s, l) for s, l, created_at in rows
-                     if created_at.date() < recent_start]
+            buckets = {"recent": [], "prior": []}
+            for s, l, created_at in rows:
+                bucket = bucket_for(created_at, today, window_days)
+                if bucket:
+                    buckets[bucket].append((s, l))
+            recent, prior = buckets["recent"], buckets["prior"]
             if len(recent) < min_reviews or len(prior) < min_reviews:
                 continue
             recent_avg = weighted_avg_stars(recent)
@@ -122,8 +143,7 @@ def detect_rating_drops(window_days: int, drop_threshold: float,
 def detect_topic_surges(window_days: int, today: dt.date) -> int:
     """Flag topics whose mention count jumped vs the prior window."""
     created = 0
-    recent_start = today - dt.timedelta(days=window_days)
-    prior_start = today - dt.timedelta(days=2 * window_days)
+    prior_cutoff = today - dt.timedelta(days=2 * window_days)
 
     with SessionLocal() as session:
         apps = list(session.execute(select(App).where(App.is_active.is_(True))).scalars())
@@ -135,14 +155,17 @@ def detect_topic_surges(window_days: int, today: dt.date) -> int:
                 .where(Review.app_id == app.id,
                        Review.topics.is_not(None),
                        Review.created_at.is_not(None),
-                       Review.created_at >= dt.datetime.combine(
-                           prior_start, dt.time.min, tzinfo=dt.timezone.utc))
+                       Review.created_at > dt.datetime.combine(
+                           prior_cutoff, dt.time.max, tzinfo=dt.timezone.utc))
             ))
             recent_counts: dict[str, int] = {}
             prior_counts: dict[str, int] = {}
             samples: dict[str, list[str]] = {}
             for topics, created_at, comment in rows:
-                bucket = recent_counts if created_at.date() >= recent_start else prior_counts
+                which = bucket_for(created_at, today, window_days)
+                if which is None:
+                    continue
+                bucket = recent_counts if which == "recent" else prior_counts
                 for topic in topics or []:
                     if topic == "praise":
                         continue  # surges of praise are lovely but not actionable
@@ -228,7 +251,10 @@ def main() -> int:
 
     if args.retag:
         with session_scope() as session:
-            session.execute(update(Review).values(topics=None))
+            # null() forces SQL NULL; a bare None would serialize as JSONB
+            # 'null', which `topics IS NULL` never matches — the retag would
+            # permanently orphan every review from the tagger.
+            session.execute(update(Review).values(topics=null()))
         log.info("Cleared existing tags for retag")
 
     tagged = tag_reviews()
