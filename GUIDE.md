@@ -152,16 +152,33 @@ Undelivered items stay queued — if the webhook is down or unset, nothing is
 lost; the next successful `notify.py` run sends the backlog.
 `SLACK_WEBHOOK_URL` works the same way (both can be set at once).
 
-## 7. Scheduling (Windows)
+## 7. Scheduling (Windows) — already set up
+
+Two scheduled tasks are registered on this machine and two batch files live
+in the repo (double-click either to run manually any time):
+
+| Task | When | Runs | Log |
+|---|---|---|---|
+| `iSpy collect` | daily 06:00 | [run_daily.bat](run_daily.bat) — snapshot → events → reviews → spikes → notify | `logs\ispy.log` |
+| `iSpy market` | Mondays 06:45 | [run_weekly.bat](run_weekly.bat) — market report → install spikes → notify | `logs\ispy.log` |
+
+Manage them in **Task Scheduler** (Start menu → "Task Scheduler") or:
 
 ```powershell
-$py = "C:\path\to\python.exe"; $repo = "C:\Users\Omen\Downloads\iSpy"
-schtasks /Create /SC DAILY /ST 06:00 /TN "iSpy collect" /TR "cmd /c cd /d $repo && $py daily_snapshot.py && $py detect_events.py && $py analyze_reviews.py && $py detect_spikes.py && $py notify.py"
-schtasks /Create /SC WEEKLY /D MON /ST 06:45 /TN "iSpy market" /TR "cmd /c cd /d $repo && $py market_report.py && $py notify.py"
+schtasks /Run    /TN "iSpy collect"    # run right now
+schtasks /Query  /TN "iSpy collect"    # next run time / status
+schtasks /Delete /TN "iSpy collect" /F # remove
 ```
 
-(`.env` is found relative to the repo regardless of the working directory,
-but `cd /d` keeps relative paths tidy.) On Linux/macOS the equivalent cron:
+Two operational notes:
+- **Docker Desktop must be running** at 06:00 (the database lives in it).
+  Enable *Docker Desktop → Settings → General → "Start Docker Desktop when
+  you sign in"* and the db container comes up automatically.
+- Tasks run only while you're **logged in**; if the PC was off/asleep at
+  06:00, just double-click `run_daily.bat` when you're back — every job is
+  idempotent and self-heals gaps.
+
+On Linux/macOS the equivalent cron:
 
 ```cron
 0 6 * * *  cd /path/to/iSpy && python daily_snapshot.py && python detect_events.py && python analyze_reviews.py && python detect_spikes.py && python notify.py
