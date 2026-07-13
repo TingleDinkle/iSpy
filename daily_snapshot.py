@@ -41,6 +41,7 @@ from tracker.ingest import (
     refresh_app_metadata,
     sync_developer_apps,
     upsert_daily_installs,
+    upsert_developer_estimates,
     upsert_monthly_estimates,
     upsert_rankings,
     upsert_snapshot,
@@ -51,6 +52,7 @@ from tracker.models import (
     DailyInstalls,
     Developer,
     DeveloperApp,
+    DeveloperEstimate,
     RankingWatch,
     STORE_IOS,
     STORE_PLAY,
@@ -66,6 +68,11 @@ APP_DETAIL_FIELDS = (
     "released", "updated", "removed",
     # intelligence fields diffed by detect_events.py:
     "whatsnew", "icon", "screenshots", "countries_list", "advertised",
+    "top_countries_revenue", "top_countries_downloads",  # geo revenue mix
+    "description",           # ASO/listing rewrites
+    "ads",                    # UA creative URLs (iOS object; Play boolean)
+    "languages",              # localization coverage (archived in raw)
+    "transferred", "previous_developer_id", "previous_developer_name",
 )
 
 
@@ -129,6 +136,27 @@ def snapshot_rankings(client: AppstoreSpyClient, watch: RankingWatch,
                                rank_end=watch.rank_depth)
     with session_scope() as session:
         return upsert_rankings(session, watch.store, rows)
+
+
+def snapshot_developer_estimates(client: AppstoreSpyClient, dev: Developer,
+                                 today: dt.date) -> int:
+    """Studio-level monthly revenue/downloads, refreshed weekly (estimates
+    are monthly — pulling daily would waste a credit per studio per day)."""
+    with SessionLocal() as session:
+        last_fetch = session.execute(
+            select(func.max(DeveloperEstimate.fetched_at))
+            .where(DeveloperEstimate.developer_id == dev.id)
+        ).scalar_one()
+    if last_fetch is not None:
+        age = dt.datetime.now(dt.timezone.utc) - last_fetch
+        if age.days < settings.developer_estimates_refresh_days:
+            return 0
+    start = today - dt.timedelta(days=400)
+    rows = client.get_developer_estimates(dev.store, dev.store_dev_id,
+                                          start=start, end=today)
+    with session_scope() as session:
+        db_dev = session.get(Developer, dev.id)
+        return upsert_developer_estimates(session, db_dev, rows)
 
 
 def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
@@ -300,7 +328,8 @@ def main() -> int:
     client = AppstoreSpyClient()
     failures: list[str] = []
     stats = {"snapshots": 0, "estimate_rows": 0, "install_rows": 0,
-             "new_reviews": 0, "ranking_rows": 0, "new_dev_apps": 0, "events": 0}
+             "new_reviews": 0, "ranking_rows": 0, "new_dev_apps": 0,
+             "dev_estimate_rows": 0, "events": 0}
 
     try:
         # Per-app details + reviews + (Play) daily installs
@@ -381,6 +410,8 @@ def main() -> int:
                     new_apps, events = discover_developer_apps(client, dev, today)
                     stats["new_dev_apps"] += new_apps
                     stats["events"] += events
+                    stats["dev_estimate_rows"] += snapshot_developer_estimates(
+                        client, dev, today)
                 except (AuthenticationError, CreditBudgetExhausted):
                     raise
                 except AppstoreSpyError as exc:
@@ -398,7 +429,7 @@ def main() -> int:
         "Done. snapshots=%(snapshots)d estimate_rows=%(estimate_rows)d "
         "install_rows=%(install_rows)d new_reviews=%(new_reviews)d "
         "ranking_rows=%(ranking_rows)d new_dev_apps=%(new_dev_apps)d "
-        "events=%(events)d", stats,
+        "dev_estimate_rows=%(dev_estimate_rows)d events=%(events)d", stats,
     )
     log.info("Credits used this month: %d / %d",
              client.ledger.used_this_month, client.ledger.budget)

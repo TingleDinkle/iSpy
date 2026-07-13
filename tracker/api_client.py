@@ -448,6 +448,23 @@ class AppstoreSpyClient:
         """Developer/studio profile (name, totals, top_apps)."""
         return self._request(f"/{store}/developers/{dev_id}")
 
+    def get_developer_estimates(
+        self,
+        store: str,
+        dev_id: str,
+        start: Optional[dt.date] = None,
+        end: Optional[dt.date] = None,
+    ) -> list[dict[str, Any]]:
+        """Studio-level monthly revenue/downloads history.
+        Rows: {"month": "YYYY-MM", "revenue": int, "downloads": int}."""
+        params: dict[str, Any] = {}
+        if start:
+            params["start"] = start.isoformat()
+        if end:
+            params["end"] = end.isoformat()
+        data = self._request(f"/{store}/developers/{dev_id}/estimates", params)
+        return data or []
+
     def search_apps(
         self,
         store: str,

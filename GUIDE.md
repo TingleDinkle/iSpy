@@ -18,8 +18,14 @@ Everything below was tested end-to-end against the live API on 2026-07-13.
 | "Is a competitor soft-launching something?" | `new_developer_app` / `soft_launch_detected` events |
 | "Did someone start a UA push or change store creatives?" | `ua_start` / `icon_change` / `screenshots_change` events |
 | "Are players revolting about a mechanic?" | review topics (`difficulty`, `monetization`, …), `review_topic_surge` events, rating-drop alerts |
-| "Is my genre growing?" | `market_report.py` — apps live, downloads/mo, revenue/mo per saved segment |
+| "Is my genre growing?" | `market_report.py` — apps live, downloads/mo, revenue/mo per saved segment (weekly `market_pulse` in the digest) |
 | "Whose revenue spiked 50%?" | `detect_spikes.py` alerts vs 7-day moving average |
+| "What NEW game is blowing up in my genre?" | `discover_releases.py` — weekly sweep of recent releases with real traction, any studio (`breakout_release` events) |
+| "How is a competitor STUDIO doing overall?" | `v_studio_estimates` — monthly revenue/downloads per watched studio, per store |
+| "Where does their money come from?" | `geo_revenue_shift` events when a top-5 revenue country changes; full lists in snapshot `raw` |
+| "What ad creatives are they running?" | `ad_creative_change` events with direct video/image URLs (iOS) |
+| "Did a game change owners?" | `app_transferred` events (studio M&A signal) |
+| "Are they A/B-testing their store listing?" | `listing_change` (description rewrites) + icon/screenshot events |
 
 Your setup is already seeded with: 16 puzzle/casual genre leaders (Candy
 Crush, Royal Match, Gardenscapes, Homescapes, Merge Mansion, Gossip Harbor,
@@ -160,7 +166,7 @@ in the repo (double-click either to run manually any time):
 | Task | When | Runs | Log |
 |---|---|---|---|
 | `iSpy collect` | daily 06:00 | [run_daily.bat](run_daily.bat) — snapshot → events → reviews → spikes → notify | `logs\ispy.log` |
-| `iSpy market` | Mondays 06:45 | [run_weekly.bat](run_weekly.bat) — market report → install spikes → notify | `logs\ispy.log` |
+| `iSpy market` | Mondays 06:45 | [run_weekly.bat](run_weekly.bat) — market report → breakout sweep → install spikes → notify | `logs\ispy.log` |
 
 Manage them in **Task Scheduler** (Start menu → "Task Scheduler") or:
 
@@ -201,6 +207,7 @@ Pre-built views to chart directly (no SQL needed):
 | `v_review_topics_weekly` | stacked area of complaint topics per app |
 | `v_rating_weekly` | star trend per app |
 | `v_market_history` | your genre's size over time |
+| `v_studio_estimates` | monthly revenue/downloads per watched studio |
 | `v_latest_metrics` | current-state leaderboard of tracked apps |
 | `v_alerts_feed` | spike/rating alerts |
 
@@ -228,12 +235,15 @@ plan. If you ever approach the cap: move apps to `watch`, run
 | Knob | Default | Meaning |
 |---|---|---|
 | `SPIKE_THRESHOLD_PCT` | 50 | revenue/installs spike sensitivity |
-| `RANK_ENTRY_TOP` | 50 | "entered top N" event range |
+| `RANK_ENTRY_TOP` | 50 | "entered top N" event range (Grossing/Free/Paid) |
+| `RANK_CHURNY_ENTRY_TOP` | 10 | tighter bar for high-churn charts (movers, new releases) |
 | `RANK_JUMP_MIN` | 20 | positions gained to report a jump |
 | `RATING_DROP_STARS` | 0.5 | 7d star-average drop that alerts |
 | `TOPIC_SURGE_MIN` / `TOPIC_SURGE_RATIO` | 5 / 3.0 | review-topic surge sensitivity |
 | `SOFT_LAUNCH_MAX_COUNTRIES` | 15 | storefront count for soft-launch heuristic |
 | `WATCH_REFRESH_DAYS` | 7 | watch-tier refresh cadence |
+| `BREAKOUT_MIN_DOWNLOADS` | 50000 | monthly downloads for a breakout-release event |
+| `BREAKOUT_RELEASE_DAYS` | 30 | how recent a release must be to count |
 | `PLAY_REVIEW_LANGUAGE` | en_US | Play review language (enum) |
 
 ## 11. Troubleshooting

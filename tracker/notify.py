@@ -25,11 +25,15 @@ MAX_ITEMS_PER_DIGEST = 60
 # event_type -> (section, emoji). Ordered by signal density: updates and
 # launches are rare and always matter; chart churn is voluminous, so last.
 SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
-    ("Updates shipped", "🛠️", ("version_update",)),
+    ("Updates shipped", "🛠️", ("version_update", "listing_change")),
     ("Launch radar", "🌍", ("new_developer_app", "soft_launch_detected",
-                            "global_launch", "countries_expanded", "countries_reduced")),
-    ("UA & creative", "📣", ("ua_start", "ua_stop", "icon_change", "screenshots_change")),
+                            "global_launch", "breakout_release",
+                            "countries_expanded", "countries_reduced")),
+    ("Business signals", "💼", ("app_transferred", "geo_revenue_shift")),
+    ("UA & creative", "📣", ("ua_start", "ua_stop", "icon_change",
+                             "screenshots_change", "ad_creative_change")),
     ("Review signals", "🗣️", ("review_topic_surge",)),
+    ("Market pulse", "📈", ("market_pulse",)),
     ("Chart moves", "🚀", ("chart_entry", "rank_jump", "chart_leader_change")),
 ]
 

@@ -10,7 +10,7 @@ import datetime as dt
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ from .models import (
     DailyInstalls,
     Developer,
     DeveloperApp,
+    DeveloperEstimate,
     MarketSegment,
     MarketSnapshot,
     MonthlyEstimate,
@@ -232,6 +233,35 @@ def sync_developer_apps(
         existing.add(str(app_id))
         new_rows.append(dev_app)
     return new_rows
+
+
+def upsert_developer_estimates(
+    session: Session, developer: Developer, rows: list[dict[str, Any]]
+) -> int:
+    """Upsert studio-level monthly estimates. ``month`` arrives as 'YYYY-MM'."""
+    written = 0
+    for row in rows:
+        try:
+            month = dt.datetime.strptime(row["month"], "%Y-%m").date()
+        except (KeyError, TypeError, ValueError):
+            log.warning("Developer estimate with bad month %r — skipped", row.get("month"))
+            continue
+        stmt = pg_insert(DeveloperEstimate).values(
+            developer_id=developer.id,
+            month=month,
+            revenue=row.get("revenue"),
+            downloads=row.get("downloads"),
+        )
+        session.execute(
+            stmt.on_conflict_do_update(
+                constraint="uq_dev_estimates",
+                set_={"revenue": stmt.excluded.revenue,
+                      "downloads": stmt.excluded.downloads,
+                      "fetched_at": func.now()},
+            )
+        )
+        written += 1
+    return written
 
 
 def insert_event(

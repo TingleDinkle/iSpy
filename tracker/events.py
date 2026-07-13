@@ -32,6 +32,17 @@ def store_url(store: str, store_app_id: str) -> str:
     return f"https://play.google.com/store/apps/details?id={store_app_id}"
 
 
+# Collections that churn by design: entries at #40-50 are daily noise there,
+# so only the very top of these charts is worth an event.
+CHURNY_COLLECTIONS = {"movers_shakers", "topselling_new_free", "topselling_new_paid"}
+
+
+def entry_top_for_collection(collection: str) -> int:
+    if collection in CHURNY_COLLECTIONS:
+        return min(settings.rank_entry_top, settings.rank_churny_entry_top)
+    return settings.rank_entry_top
+
+
 def looks_like_soft_launch(countries: Optional[list[str]]) -> bool:
     """Small storefront set without the big global markets = likely soft launch."""
     if not countries:
@@ -105,6 +116,71 @@ def diff_snapshots(
         else:
             drafts.append(EventDraft(
                 "ua_stop", f"{app_name} stopped running ads", {}
+            ))
+
+    # ownership transfer: the strongest business signal in the payload
+    prev_dev = prev_raw.get("developer_id")
+    curr_dev = curr_raw.get("developer_id")
+    if prev_dev and curr_dev and str(prev_dev) != str(curr_dev):
+        old_name = prev_raw.get("developer_name") or prev_dev
+        new_name = curr_raw.get("developer_name") or curr_dev
+        drafts.append(EventDraft(
+            "app_transferred",
+            f"{app_name} CHANGED HANDS: {old_name} -> {new_name}",
+            {"old_developer": str(prev_dev), "new_developer": str(curr_dev),
+             "old_name": old_name, "new_name": new_name},
+        ))
+
+    # geo revenue mix: where the money comes from, top-5 storefronts
+    prev_geo = prev_raw.get("top_countries_revenue") or []
+    curr_geo = curr_raw.get("top_countries_revenue") or []
+    if prev_geo and curr_geo and prev_geo != curr_geo:
+        gained = [c for c in curr_geo if c not in prev_geo]
+        lost = [c for c in prev_geo if c not in curr_geo]
+        leader_changed = prev_geo[0] != curr_geo[0]
+        if gained or lost or leader_changed:
+            bits = []
+            if leader_changed:
+                bits.append(f"new top market {curr_geo[0]} (was {prev_geo[0]})")
+            if gained:
+                bits.append("+" + ",".join(gained))
+            if lost:
+                bits.append("-" + ",".join(lost))
+            drafts.append(EventDraft(
+                "geo_revenue_shift",
+                f"{app_name} revenue mix shifted: {'; '.join(bits)}",
+                {"old_top5": prev_geo, "new_top5": curr_geo},
+            ))
+
+    # store-listing rewrite: ASO experiment signal
+    prev_desc = prev_raw.get("description")
+    curr_desc = curr_raw.get("description")
+    if prev_desc and curr_desc and prev_desc != curr_desc:
+        drafts.append(EventDraft(
+            "listing_change",
+            f"{app_name} rewrote its store description "
+            f"({len(prev_desc)} -> {len(curr_desc)} chars)",
+            {"old_length": len(prev_desc), "new_length": len(curr_desc),
+             "new_opening": _clip(curr_desc, 200)},
+        ))
+
+    # UA creative rotation (iOS returns an ads OBJECT with creative URLs;
+    # Play's ads field is a boolean — only diff the object form)
+    prev_ads = prev_raw.get("ads")
+    curr_ads = curr_raw.get("ads")
+    if isinstance(prev_ads, dict) and isinstance(curr_ads, dict):
+        changes = {}
+        for kind in ("video", "image"):
+            old_url = (prev_ads.get(kind) or {}).get("url")
+            new_url = (curr_ads.get(kind) or {}).get("url")
+            if old_url and new_url and old_url != new_url:
+                changes[kind] = {"old": old_url, "new": new_url}
+        if changes:
+            drafts.append(EventDraft(
+                "ad_creative_change",
+                f"{app_name} rotated UA creatives ({', '.join(changes)}) — "
+                f"links in details",
+                changes,
             ))
 
     prev_countries = prev_raw.get("countries_list") or []

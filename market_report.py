@@ -21,7 +21,7 @@ from sqlalchemy import select
 from tracker import utf8_console
 from tracker.api_client import AppstoreSpyClient, AppstoreSpyError
 from tracker.db import SessionLocal, session_scope
-from tracker.ingest import upsert_market_snapshot
+from tracker.ingest import insert_event, upsert_market_snapshot
 from tracker.models import MarketSegment, MarketSnapshot
 
 log = logging.getLogger("market_report")
@@ -89,6 +89,20 @@ def main() -> int:
                   f"{_fmt(summary.get('downloads'), prev.downloads if prev else None):>18} "
                   f"{_fmt(summary.get('revenue'), prev.revenue if prev else None, money=True):>18} "
                   f"{_fmt(summary.get('ipd'), prev.ipd if prev else None):>15}")
+            # a 'market_pulse' event so the sizing reaches the Discord digest
+            insert_event(
+                session,
+                event_type="market_pulse",
+                event_date=today,
+                title=(f"{segment.name}: "
+                       f"{_fmt(summary.get('revenue'), prev.revenue if prev else None, money=True)} rev/mo, "
+                       f"{_fmt(summary.get('downloads'), prev.downloads if prev else None)} dl/mo, "
+                       f"{_fmt(summary.get('available'), prev.available if prev else None)} apps live"),
+                details={"summary": summary,
+                         "previous_date": prev.date.isoformat() if prev else None},
+                dedupe_key=f"market_pulse|{segment.id}|{today}",
+                store=segment.store,
+            )
 
     print()
     log.info("Credits used this month: %d / %d",

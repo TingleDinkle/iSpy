@@ -296,6 +296,26 @@ class Developer(Base):
     )
 
 
+class DeveloperEstimate(Base):
+    """Studio-level monthly revenue/downloads (GET /{store}/developers/{id}/estimates)."""
+
+    __tablename__ = "developer_estimates"
+    __table_args__ = (
+        UniqueConstraint("developer_id", "month", name="uq_dev_estimates"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    developer_id: Mapped[int] = mapped_column(
+        ForeignKey("developers.id", ondelete="CASCADE"), nullable=False
+    )
+    month: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    revenue: Mapped[Optional[int]] = mapped_column(BigInteger)
+    downloads: Mapped[Optional[int]] = mapped_column(BigInteger)
+    fetched_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class DeveloperApp(Base):
     """Every app ever observed in a tracked studio's portfolio."""
 

@@ -53,9 +53,15 @@ class Settings(BaseSettings):
     rankings_lookback_days: int = 3      # chart feed lags ~2 days upstream; cover 2+ days
     rankings_page_size: int = 1000       # API max for /rankings
 
+    # --- Genre-wide breakout sweep (discover_releases.py, weekly) ---
+    breakout_release_days: int = 30       # "new" = released within this window
+    breakout_min_downloads: int = 50_000  # monthly downloads to count as a breakout
+    developer_estimates_refresh_days: int = 7  # studio revenue history cadence
+
     # --- Event detection ---
     rank_track_depth: int = 200          # default rank_end for new ranking watches
     rank_entry_top: int = 50             # 'chart_entry' fires for apps entering this range
+    rank_churny_entry_top: int = 10      # tighter bar for high-churn charts (movers, new)
     rank_jump_min: int = 20              # min positions gained for a 'rank_jump' event
     soft_launch_max_countries: int = 15  # <= this many storefronts (no US/GB) = soft launch
 

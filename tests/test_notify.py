@@ -42,6 +42,7 @@ class TestFormatDigest:
             event("ua_start", "C started running ads"),
             event("review_topic_surge", "D crash complaints surging"),
             event("new_developer_app", "Studio has a new game: E"),
+            event("market_pulse", "play-puzzle: $236M rev/mo"),
         ]
         text = "\n".join(format_digest(alerts, events, {1: "Candy Crush (ios)"},
                                        today=TODAY))
@@ -52,6 +53,7 @@ class TestFormatDigest:
         assert text.index("Launch radar") < text.index("Chart moves")
         assert "UA & creative" in text
         assert "Review signals" in text
+        assert text.index("Market pulse") < text.index("Chart moves")
 
     def test_alert_line_shows_direction_and_magnitude(self):
         chunks = format_digest([alert(pct=-12.5, metric="rating",

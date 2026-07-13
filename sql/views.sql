@@ -57,6 +57,12 @@ JOIN apps a ON a.id = r.app_id
 WHERE r.created_at IS NOT NULL
 GROUP BY a.store, a.name, date_trunc('week', r.created_at);
 
+CREATE OR REPLACE VIEW v_studio_estimates AS
+SELECT d.store, d.name AS studio, e.month, e.revenue, e.downloads
+FROM developer_estimates e
+JOIN developers d ON d.id = e.developer_id
+ORDER BY d.name, e.month;
+
 CREATE OR REPLACE VIEW v_market_history AS
 SELECT seg.name AS segment, seg.store, m.date,
        m.available, m.downloads, m.revenue, m.ipd, m.total, m.removed

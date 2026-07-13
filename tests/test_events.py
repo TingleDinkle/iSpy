@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import pytest
 
+from tracker.config import settings
 from tracker.events import (
+    CHURNY_COLLECTIONS,
     EventDraft,
     analyze_rank_moves,
     diff_snapshots,
+    entry_top_for_collection,
     looks_like_soft_launch,
 )
 
@@ -24,6 +27,12 @@ BASE = {
     "screenshots": ["https://cdn/s1.png", "https://cdn/s2.png"],
     "advertised": False,
     "countries_list": ["US", "GB", "DE", "FR"],
+    "developer_id": "111",
+    "developer_name": "Original Studio",
+    "top_countries_revenue": ["US", "GB", "CA", "AU", "DE"],
+    "description": "A wonderful match-3 adventure through candy kingdoms.",
+    "ads": {"video": {"url": "https://cdn/ad-v1.mp4"},
+            "image": {"url": "https://cdn/ad-i1.jpg"}},
 }
 
 
@@ -111,6 +120,61 @@ class TestDiffSnapshots:
         assert types(drafts) == ["icon_change", "ua_start", "version_update"]
 
 
+class TestBusinessSignalDiffs:
+    def test_app_transfer_detected(self):
+        curr = {**BASE, "developer_id": "222", "developer_name": "Acquirer Corp"}
+        drafts = diff_snapshots(dict(BASE), curr, "Sold Game")
+        assert types(drafts) == ["app_transferred"]
+        assert "Original Studio" in drafts[0].title
+        assert "Acquirer Corp" in drafts[0].title
+
+    def test_same_developer_no_transfer(self):
+        assert diff_snapshots(dict(BASE), dict(BASE), "G") == []
+
+    def test_geo_leader_change_reported(self):
+        curr = {**BASE, "top_countries_revenue": ["JP", "US", "GB", "CA", "AU"]}
+        drafts = diff_snapshots(dict(BASE), curr, "G")
+        assert types(drafts) == ["geo_revenue_shift"]
+        assert "new top market JP" in drafts[0].title
+
+    def test_geo_membership_change_reported(self):
+        curr = {**BASE, "top_countries_revenue": ["US", "GB", "CA", "AU", "KR"]}
+        drafts = diff_snapshots(dict(BASE), curr, "G")
+        assert types(drafts) == ["geo_revenue_shift"]
+        assert drafts[0].details["new_top5"][-1] == "KR"
+
+    def test_geo_reorder_below_leader_is_quiet(self):
+        # 2nd and 3rd place swapping is estimate jitter, not a shift
+        curr = {**BASE, "top_countries_revenue": ["US", "CA", "GB", "AU", "DE"]}
+        assert diff_snapshots(dict(BASE), curr, "G") == []
+
+    def test_listing_rewrite_reported_with_lengths(self):
+        curr = {**BASE, "description": "Now with WEEKLY EVENTS! " * 10}
+        drafts = diff_snapshots(dict(BASE), curr, "G")
+        assert types(drafts) == ["listing_change"]
+        assert drafts[0].details["old_length"] == len(BASE["description"])
+
+    def test_ad_creative_rotation_reported_with_urls(self):
+        curr = {**BASE, "ads": {"video": {"url": "https://cdn/ad-v2.mp4"},
+                                "image": {"url": "https://cdn/ad-i1.jpg"}}}
+        drafts = diff_snapshots(dict(BASE), curr, "G")
+        assert types(drafts) == ["ad_creative_change"]
+        assert drafts[0].details == {"video": {"old": "https://cdn/ad-v1.mp4",
+                                               "new": "https://cdn/ad-v2.mp4"}}
+
+    def test_play_boolean_ads_field_never_diffs(self):
+        prev = {**BASE, "ads": False}
+        curr = {**BASE, "ads": True}
+        assert diff_snapshots(prev, curr, "G") == []
+
+    def test_first_appearance_of_new_fields_is_not_an_event(self):
+        # transition day: older snapshots lack the newly-fetched fields
+        prev = {k: v for k, v in BASE.items()
+                if k not in ("top_countries_revenue", "description", "ads",
+                             "developer_id")}
+        assert diff_snapshots(prev, dict(BASE), "G") == []
+
+
 class TestSoftLaunchHeuristic:
     def test_small_test_market_set_is_soft_launch(self):
         assert looks_like_soft_launch(["PH", "CA", "AU", "NZ"])
@@ -191,3 +255,24 @@ class TestRankMoves:
         curr = {"a": 1}
         moves = analyze_rank_moves(prev, curr, "chart", entry_top=50, jump_min=20)
         assert moves == []
+
+
+class TestChurnyChartThresholds:
+    def test_churny_collections_get_tight_entry_bar(self):
+        for collection in CHURNY_COLLECTIONS:
+            assert entry_top_for_collection(collection) == settings.rank_churny_entry_top
+
+    def test_stable_collections_keep_the_wide_bar(self):
+        for collection in ("Grossing", "Free", "Paid", "topgrossing", "topselling_free"):
+            assert entry_top_for_collection(collection) == settings.rank_entry_top
+
+    def test_movers_entry_at_40_suppressed_but_top10_reported(self):
+        entry_top = entry_top_for_collection("movers_shakers")
+        prev = {"a": 1}
+        churn = {"a": 1, "noise": 40}
+        assert analyze_rank_moves(prev, churn, "movers", entry_top=entry_top,
+                                  jump_min=20) == []
+        breakout = {"a": 1, "star": 7}
+        moves = analyze_rank_moves(prev, breakout, "movers", entry_top=entry_top,
+                                   jump_min=20)
+        assert [(app, d.event_type) for app, d in moves] == [("star", "chart_entry")]

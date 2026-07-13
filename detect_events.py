@@ -20,7 +20,12 @@ from sqlalchemy import select
 
 from tracker import utf8_console
 from tracker.db import SessionLocal, session_scope
-from tracker.events import analyze_rank_moves, diff_snapshots, store_url
+from tracker.events import (
+    analyze_rank_moves,
+    diff_snapshots,
+    entry_top_for_collection,
+    store_url,
+)
 from tracker.ingest import insert_event
 from tracker.models import App, AppSnapshot, Ranking, RankingWatch, STORE_IOS
 
@@ -121,7 +126,9 @@ def detect_rank_events() -> int:
                 label = f"{watch.store}/{watch.country}/{watch.category}/{collection}"
                 if watch.store == STORE_IOS and platform != "all":
                     label += f" ({platform})"
-                moves = analyze_rank_moves(sides["prev"], sides["curr"], label, names=names)
+                moves = analyze_rank_moves(sides["prev"], sides["curr"], label,
+                                           names=names,
+                                           entry_top=entry_top_for_collection(collection))
                 for app_id, draft in moves:
                     inserted = insert_event(
                         session,
