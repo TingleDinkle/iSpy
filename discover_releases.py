@@ -12,17 +12,16 @@ Run weekly (wired into run_weekly.bat):
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import logging
 import sys
 
 from sqlalchemy import select
 
-from tracker import utf8_console
 from tracker.api_client import AppstoreSpyClient, AppstoreSpyError
+from tracker.cli import build_parser, init_script
 from tracker.config import settings
-from tracker.db import SessionLocal, session_scope
+from tracker.db import load_active, session_scope
 from tracker.events import store_url
 from tracker.ingest import insert_event
 from tracker.models import App, RankingWatch
@@ -77,21 +76,12 @@ def sweep_category(client: AppstoreSpyClient, store: str, category: str,
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser = build_parser(__doc__)
     args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
 
     today = dt.datetime.now(dt.timezone.utc).date()
-    with SessionLocal() as session:
-        watches = list(session.execute(
-            select(RankingWatch).where(RankingWatch.is_active.is_(True))
-        ).scalars())
+    watches = load_active(RankingWatch)
     if not watches:
         log.error("No chart watches — add one: python manage.py add-watch ios US GAMES_PUZZLE")
         return 1
@@ -99,12 +89,14 @@ def main() -> int:
     client = AppstoreSpyClient()
     total = 0
     failures = 0
-    for watch in watches:
+    # The query is country-independent, so N country variants of one chart
+    # would buy N identical API calls — sweep each (store, category) once.
+    for store, category in sorted({(w.store, w.category) for w in watches}):
         try:
-            total += sweep_category(client, watch.store, watch.category, today)
+            total += sweep_category(client, store, category, today)
         except AppstoreSpyError as exc:
             failures += 1
-            log.error("sweep %s/%s failed: %s", watch.store, watch.category, exc)
+            log.error("sweep %s/%s failed: %s", store, category, exc)
 
     log.info("Done: %d breakout release(s) found. Send with: python notify.py", total)
     return 1 if failures else 0

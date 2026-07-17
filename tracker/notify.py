@@ -147,20 +147,19 @@ def _post_with_retry(url: str, payload: dict, sink: str) -> None:
 def send_chunks(chunks: list[str]) -> list[str]:
     """Send to every configured sink. Returns the sink names that succeeded;
     raises NotifyFailed only if a configured sink failed."""
+    sinks = [
+        ("discord", settings.discord_webhook_url, "content"),
+        ("slack", settings.slack_webhook_url, "text"),
+    ]
     delivered: list[str] = []
     failures: list[str] = []
-    if settings.discord_webhook_url:
+    for name, url, payload_key in sinks:
+        if not url:
+            continue
         try:
             for chunk in chunks:
-                _post_with_retry(settings.discord_webhook_url, {"content": chunk}, "discord")
-            delivered.append("discord")
-        except NotifyFailed as exc:
-            failures.append(str(exc))
-    if settings.slack_webhook_url:
-        try:
-            for chunk in chunks:
-                _post_with_retry(settings.slack_webhook_url, {"text": chunk}, "slack")
-            delivered.append("slack")
+                _post_with_retry(url, {payload_key: chunk}, name)
+            delivered.append(name)
         except NotifyFailed as exc:
             failures.append(str(exc))
     if failures:

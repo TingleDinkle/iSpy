@@ -12,14 +12,13 @@ Run daily, after daily_snapshot.py:
 
 from __future__ import annotations
 
-import argparse
 import logging
 import sys
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from tracker import utf8_console
-from tracker.db import SessionLocal, session_scope
+from tracker.cli import build_parser, init_script
+from tracker.db import load_active, session_scope
 from tracker.events import (
     analyze_rank_moves,
     diff_snapshots,
@@ -33,24 +32,42 @@ log = logging.getLogger("detect_events")
 
 
 def detect_snapshot_events() -> int:
-    """Diff the two most recent snapshots of every active app."""
+    """Diff the two most recent snapshots of every active app.
+
+    One windowed query fetches the latest two snapshots for ALL apps at once
+    (instead of a session + LIMIT-2 query per app — an N+1 at fleet scale)."""
     created = 0
-    with SessionLocal() as session:
-        apps = list(session.execute(
-            select(App).where(App.is_active.is_(True))
+    apps = {a.id: a for a in load_active(App)}
+    if not apps:
+        return 0
+
+    rn = func.row_number().over(
+        partition_by=AppSnapshot.app_id,
+        order_by=AppSnapshot.snapshot_date.desc(),
+    ).label("rn")
+    ranked = (
+        select(AppSnapshot.id, rn)
+        .where(AppSnapshot.app_id.in_(list(apps)))
+        .subquery()
+    )
+
+    with session_scope() as session:
+        rows = list(session.execute(
+            select(AppSnapshot)
+            .join(ranked, AppSnapshot.id == ranked.c.id)
+            .where(ranked.c.rn <= 2)
+            .order_by(AppSnapshot.app_id, AppSnapshot.snapshot_date.desc())
         ).scalars())
 
-    for app in apps:
-        with session_scope() as session:
-            last_two = list(session.execute(
-                select(AppSnapshot)
-                .where(AppSnapshot.app_id == app.id)
-                .order_by(AppSnapshot.snapshot_date.desc())
-                .limit(2)
-            ).scalars())
-            if len(last_two) < 2:
+        by_app: dict[int, list[AppSnapshot]] = {}
+        for snap in rows:
+            by_app.setdefault(snap.app_id, []).append(snap)
+
+        for app_id, snaps in by_app.items():
+            if len(snaps) < 2:
                 continue
-            curr, prev = last_two[0], last_two[1]
+            curr, prev = snaps[0], snaps[1]
+            app = apps[app_id]
             name = app.name or app.store_app_id
             for draft in diff_snapshots(prev.raw, curr.raw, name):
                 inserted = insert_event(
@@ -73,10 +90,7 @@ def detect_snapshot_events() -> int:
 def detect_rank_events() -> int:
     """Compare the two most recent chart days for every watched chart."""
     created = 0
-    with SessionLocal() as session:
-        watches = list(session.execute(
-            select(RankingWatch).where(RankingWatch.is_active.is_(True))
-        ).scalars())
+    watches = load_active(RankingWatch)
 
     for watch in watches:
         with session_scope() as session:
@@ -148,20 +162,13 @@ def detect_rank_events() -> int:
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = build_parser(__doc__)
     parser.add_argument("--skip-snapshots", action="store_true",
                         help="skip snapshot diffing")
     parser.add_argument("--skip-rankings", action="store_true",
                         help="skip chart-movement detection")
-    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
 
     total = 0
     if not args.skip_snapshots:

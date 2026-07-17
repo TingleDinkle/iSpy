@@ -21,20 +21,18 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
-import datetime as dt
 import logging
 import sys
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from tracker import utf8_console
+from tracker.cli import build_parser, init_script
 from tracker.config import settings
 from tracker.db import engine, session_scope
-from tracker.models import Alert, App, AppSnapshot, DailyInstalls
+from tracker.ingest import insert_alert
+from tracker.models import App, AppSnapshot, DailyInstalls
 
 log = logging.getLogger("detect_spikes")
 
@@ -172,20 +170,10 @@ def persist_alerts(spikes: pd.DataFrame, metric: str, window_days: int) -> int:
     written = 0
     with session_scope() as session:
         for row in spikes.itertuples(index=False):
-            stmt = pg_insert(Alert).values(
-                app_id=int(row.app_id),
-                metric=metric,
-                alert_date=row.date,
-                value=round(row.value, 2),
-                baseline=round(row.baseline, 2),
-                pct_change=round(row.pct_change, 2),
-                window_days=window_days,
-            )
-            result = session.execute(
-                stmt.on_conflict_do_nothing(constraint="uq_alerts_app_metric_date")
-                .returning(Alert.id)  # rowcount unreliable under psycopg3
-            )
-            if result.first() is not None:
+            if insert_alert(session, app_id=int(row.app_id), metric=metric,
+                            alert_date=row.date, value=row.value,
+                            baseline=row.baseline, pct_change=row.pct_change,
+                            window_days=window_days):
                 written += 1
     return written
 
@@ -217,9 +205,7 @@ def print_report(spikes: pd.DataFrame, metric: str, threshold_pct: float) -> Non
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = build_parser(__doc__)
     parser.add_argument("--metric", choices=["revenue", "downloads", "installs"],
                         default="revenue")
     parser.add_argument("--threshold", type=float, default=settings.spike_threshold_pct,
@@ -234,13 +220,8 @@ def main() -> int:
     parser.add_argument("--full-history", action="store_true",
                         help="scan all history instead of only each app's latest day")
     parser.add_argument("--dry-run", action="store_true", help="do not write alerts")
-    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
 
     df = load_metric_frame(args.metric)
     if df.empty:

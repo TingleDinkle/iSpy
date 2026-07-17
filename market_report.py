@@ -11,16 +11,15 @@ Manage segments:
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import logging
 import sys
 
 from sqlalchemy import select
 
-from tracker import utf8_console
 from tracker.api_client import AppstoreSpyClient, AppstoreSpyError
-from tracker.db import SessionLocal, session_scope
+from tracker.cli import build_parser, init_script
+from tracker.db import load_active, session_scope
 from tracker.ingest import insert_event, upsert_market_snapshot
 from tracker.models import MarketSegment, MarketSnapshot
 
@@ -38,21 +37,12 @@ def _fmt(value, prev=None, money=False) -> str:
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser = build_parser(__doc__)
     args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
 
     today = dt.datetime.now(dt.timezone.utc).date()
-    with SessionLocal() as session:
-        segments = list(session.execute(
-            select(MarketSegment).where(MarketSegment.is_active.is_(True))
-        ).scalars())
+    segments = load_active(MarketSegment)
     if not segments:
         log.error("No segments defined. Add one: python manage.py add-segment ...")
         return 1

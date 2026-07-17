@@ -12,14 +12,13 @@ and the backlog goes out).
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import logging
 import sys
 
 from sqlalchemy import select, update
 
-from tracker import utf8_console
+from tracker.cli import build_parser, init_script
 from tracker.config import settings
 from tracker.db import SessionLocal, session_scope
 from tracker.models import Alert, App, AppEvent
@@ -60,19 +59,12 @@ def mark_notified(alerts: list[Alert], events: list[AppEvent]) -> None:
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = build_parser(__doc__)
     parser.add_argument("--dry-run", action="store_true", help="print, don't send or mark")
     parser.add_argument("--mark-only", action="store_true",
                         help="mark everything unsent as seen without sending")
-    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
 
     alerts, events, labels = collect_unsent()
     if not alerts and not events:

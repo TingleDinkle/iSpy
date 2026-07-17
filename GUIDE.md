@@ -183,6 +183,9 @@ Two operational notes:
 - Tasks run only while you're **logged in**; if the PC was off/asleep at
   06:00, just double-click `run_daily.bat` when you're back — every job is
   idempotent and self-heals gaps.
+- If a run crashes partway (outage, reboot), `python daily_snapshot.py
+  --resume` finishes the day cheaply: apps already collected today are
+  skipped, so only the remainder costs credits.
 
 On Linux/macOS the equivalent cron:
 
@@ -242,6 +245,7 @@ plan. If you ever approach the cap: move apps to `watch`, run
 | `TOPIC_SURGE_MIN` / `TOPIC_SURGE_RATIO` | 5 / 3.0 | review-topic surge sensitivity |
 | `SOFT_LAUNCH_MAX_COUNTRIES` | 15 | storefront count for soft-launch heuristic |
 | `WATCH_REFRESH_DAYS` | 7 | watch-tier refresh cadence |
+| `ESTIMATES_REFRESH_DAYS` | 7 | monthly revenue-history pulls (month-granularity data; new apps fetch immediately) |
 | `BREAKOUT_MIN_DOWNLOADS` | 50000 | monthly downloads for a breakout-release event |
 | `BREAKOUT_RELEASE_DAYS` | 30 | how recent a release must be to count |
 | `PLAY_REVIEW_LANGUAGE` | en_US | Play review language (enum) |

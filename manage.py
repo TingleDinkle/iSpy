@@ -341,10 +341,10 @@ def cmd_seed(args: argparse.Namespace) -> int:
                 print(f"  search '{title}' ({store}) failed: {exc}")
                 continue
 
-            def _norm(text: str | None) -> str:
+            def _norm(value: str | None) -> str:
                 # store listings love unicode variants ('Block\xa0Blast！') —
                 # compare on alphanumerics only
-                return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+                return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
 
             def genuine(candidate: dict) -> bool:
                 name = _norm(candidate.get("name"))

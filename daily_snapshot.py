@@ -16,7 +16,6 @@ Schedule daily via cron / Windows Task Scheduler after midnight UTC.
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import logging
 import sys
@@ -31,9 +30,9 @@ from tracker.api_client import (
     RequestFailed,
     RetriesExhausted,
 )
-from tracker import utf8_console
+from tracker.cli import build_parser, init_script
 from tracker.config import settings
-from tracker.db import SessionLocal, session_scope
+from tracker.db import SessionLocal, load_active, session_scope
 from tracker.events import looks_like_soft_launch
 from tracker.ingest import (
     insert_event,
@@ -53,6 +52,7 @@ from tracker.models import (
     Developer,
     DeveloperApp,
     DeveloperEstimate,
+    MonthlyEstimate,
     RankingWatch,
     STORE_IOS,
     STORE_PLAY,
@@ -92,10 +92,35 @@ def snapshot_app_details(client: AppstoreSpyClient, app: App, today: dt.date) ->
 
 
 def snapshot_estimates(client: AppstoreSpyClient, apps: list[App], today: dt.date) -> int:
-    """Batched monthly estimates for all apps of one store. Returns rows written."""
+    """Batched monthly estimates for all apps of one store, refreshed weekly.
+
+    The data has month granularity (revised retroactively for ~4 months), so
+    daily pulls buy nothing — at fleet scale the weekly gate saves ~1k
+    credits/month. The full lookback window is kept on every pull, so
+    upstream revisions still land within estimates_refresh_days.
+    """
     if not apps:
         return 0
     store = apps[0].store
+    with SessionLocal() as session:
+        last_fetch = session.execute(
+            select(func.max(MonthlyEstimate.fetched_at))
+            .join(App, App.id == MonthlyEstimate.app_id)
+            .where(App.store == store)
+        ).scalar_one()
+        covered = {
+            app_id for (app_id,) in session.execute(
+                select(MonthlyEstimate.app_id.distinct())
+                .where(MonthlyEstimate.app_id.in_([a.id for a in apps]))
+            )
+        }
+    new_apps = [a for a in apps if a.id not in covered]
+    if last_fetch is not None and not new_apps:
+        age = dt.datetime.now(dt.timezone.utc) - last_fetch
+        if age.days < settings.estimates_refresh_days:
+            log.info("%s estimates fresh (%dd old) — skipping until day %d",
+                     store, age.days, settings.estimates_refresh_days)
+            return 0
     start = today - dt.timedelta(days=settings.estimates_lookback_days)
     rows = client.get_estimates(store, [a.store_app_id for a in apps], start=start, end=today)
     id_map = {a.store_app_id: a.id for a in apps}
@@ -116,15 +141,13 @@ def snapshot_daily_installs(client: AppstoreSpyClient, app: App, today: dt.date)
         start = last - dt.timedelta(days=settings.installs_refetch_days)
     rows = client.get_daily_installs(app.store_app_id, start=start, end=today)
     with session_scope() as session:
-        db_app = session.get(App, app.id)
-        return upsert_daily_installs(session, db_app, rows)
+        return upsert_daily_installs(session, app, rows)
 
 
 def snapshot_reviews(client: AppstoreSpyClient, app: App) -> int:
     rows = client.get_reviews(app.store, app.store_app_id, country=app.country)
     with session_scope() as session:
-        db_app = session.get(App, app.id)
-        return insert_reviews(session, db_app, rows)
+        return insert_reviews(session, app, rows)
 
 
 def snapshot_rankings(client: AppstoreSpyClient, watch: RankingWatch,
@@ -270,9 +293,7 @@ def discover_developer_apps(client: AppstoreSpyClient, dev: Developer,
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = build_parser(__doc__)
     parser.add_argument("--store", choices=[STORE_IOS, STORE_PLAY],
                         help="limit to one store")
     parser.add_argument("--tier", choices=[TIER_PRIMARY, TIER_WATCH, "all"],
@@ -283,21 +304,16 @@ def main() -> int:
     parser.add_argument("--skip-installs", action="store_true")
     parser.add_argument("--skip-rankings", action="store_true")
     parser.add_argument("--skip-developers", action="store_true")
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip apps already snapshotted today (cheap crash "
+                             "recovery: only the remaining apps buy credits)")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
 
     today = dt.datetime.now(dt.timezone.utc).date()
 
+    all_apps = load_active(App, store=args.store)
     with SessionLocal() as session:
-        query = select(App).where(App.is_active.is_(True)).order_by(App.store, App.id)
-        if args.store:
-            query = query.where(App.store == args.store)
-        all_apps = list(session.execute(query).scalars())
         last_snapshot = dict(session.execute(
             select(AppSnapshot.app_id, func.max(AppSnapshot.snapshot_date))
             .group_by(AppSnapshot.app_id)
@@ -307,6 +323,8 @@ def main() -> int:
     # last snapshot is at least watch_refresh_days old (self-healing, so a
     # missed cron day doesn't skip a week).
     def is_due(app: App) -> bool:
+        if args.resume and last_snapshot.get(app.id) == today:
+            return False  # already bought today's data before the crash
         if args.tier == "all":
             return True
         if args.tier is not None:
@@ -320,6 +338,9 @@ def main() -> int:
     skipped_watch = len(all_apps) - len(apps)
 
     if not apps and args.skip_rankings and args.skip_developers:
+        if args.resume:
+            log.info("Resume: everything already collected today — nothing left to do.")
+            return 0
         log.error("Nothing to do. Add apps: python manage.py add-app <store> <id>")
         return 1
 
@@ -331,92 +352,71 @@ def main() -> int:
              "new_reviews": 0, "ranking_rows": 0, "new_dev_apps": 0,
              "dev_estimate_rows": 0, "events": 0}
 
+    def run_stage(label: str, fn, *fn_args):
+        """Run one collection stage with the fatal-vs-recoverable contract:
+        AuthenticationError / CreditBudgetExhausted abort the whole run (they
+        subclass AppstoreSpyError, so they MUST be re-raised before the
+        generic handler); anything else is recorded and the run continues.
+        Returns the stage result, or None on a recorded failure."""
+        try:
+            return fn(*fn_args)
+        except (AuthenticationError, CreditBudgetExhausted):
+            raise
+        except AppstoreSpyError as exc:
+            failures.append(f"{label}: {exc}")
+            log.error("%s failed: %s", label, exc)
+            return None
+
     try:
         # Per-app details + reviews + (Play) daily installs
         for app in apps:
             label = f"{app.store}:{app.store_app_id}"
-            try:
-                if snapshot_app_details(client, app, today):
-                    stats["snapshots"] += 1
-            except (AuthenticationError, CreditBudgetExhausted):
-                raise  # fatal for the whole run — handled by the outer handlers
-            except AppstoreSpyError as exc:
-                failures.append(f"{label} details: {exc}")
-                log.error("%s details failed: %s", label, exc)
+            if run_stage(f"{label} details", snapshot_app_details, client, app, today):
+                stats["snapshots"] += 1
 
             # installs and reviews are primary-tier only: they cost a credit
             # per app per day and watch apps only need the metric trail
             if (app.store == STORE_PLAY and not args.skip_installs
                     and app.tier == TIER_PRIMARY):
-                try:
-                    stats["install_rows"] += snapshot_daily_installs(client, app, today)
-                except (AuthenticationError, CreditBudgetExhausted):
-                    raise
-                except AppstoreSpyError as exc:
-                    failures.append(f"{label} installs: {exc}")
-                    log.error("%s installs failed: %s", label, exc)
+                rows = run_stage(f"{label} installs", snapshot_daily_installs,
+                                 client, app, today)
+                stats["install_rows"] += rows or 0
 
             if not args.skip_reviews and app.tier == TIER_PRIMARY:
-                try:
-                    stats["new_reviews"] += snapshot_reviews(client, app)
-                except (AuthenticationError, CreditBudgetExhausted):
-                    raise
-                except AppstoreSpyError as exc:
-                    failures.append(f"{label} reviews: {exc}")
-                    log.error("%s reviews failed: %s", label, exc)
+                reviews = run_stage(f"{label} reviews", snapshot_reviews, client, app)
+                stats["new_reviews"] += reviews or 0
 
-        # Batched monthly estimates, once per store
+        # Batched monthly estimates, once per store (weekly-gated inside)
         if not args.skip_estimates:
             for store in (STORE_IOS, STORE_PLAY):
                 store_apps = [a for a in apps if a.store == store]
-                if not store_apps:
-                    continue
-                try:
-                    stats["estimate_rows"] += snapshot_estimates(client, store_apps, today)
-                except (AuthenticationError, CreditBudgetExhausted):
-                    raise
-                except AppstoreSpyError as exc:
-                    failures.append(f"{store} estimates: {exc}")
-                    log.error("%s estimates failed: %s", store, exc)
+                if store_apps:
+                    rows = run_stage(f"{store} estimates", snapshot_estimates,
+                                     client, store_apps, today)
+                    stats["estimate_rows"] += rows or 0
 
         # Top-chart rankings for every watched category chart
         if not args.skip_rankings:
-            with SessionLocal() as session:
-                watch_query = select(RankingWatch).where(RankingWatch.is_active.is_(True))
-                if args.store:
-                    watch_query = watch_query.where(RankingWatch.store == args.store)
-                watches = list(session.execute(watch_query).scalars())
-            for watch in watches:
+            for watch in load_active(RankingWatch, store=args.store):
                 chart = f"{watch.store}/{watch.country}/{watch.category}"
-                try:
-                    rows = snapshot_rankings(client, watch, today)
+                rows = run_stage(f"rankings {chart}", snapshot_rankings,
+                                 client, watch, today)
+                if rows is not None:
                     stats["ranking_rows"] += rows
                     log.info("rankings %s: %d rows", chart, rows)
-                except (AuthenticationError, CreditBudgetExhausted):
-                    raise
-                except AppstoreSpyError as exc:
-                    failures.append(f"rankings {chart}: {exc}")
-                    log.error("rankings %s failed: %s", chart, exc)
 
-        # Studio portfolios: the new-game radar
+        # Studio portfolios: the new-game radar (+ weekly studio estimates)
         if not args.skip_developers:
-            with SessionLocal() as session:
-                dev_query = select(Developer).where(Developer.is_active.is_(True))
-                if args.store:
-                    dev_query = dev_query.where(Developer.store == args.store)
-                devs = list(session.execute(dev_query).scalars())
-            for dev in devs:
-                try:
-                    new_apps, events = discover_developer_apps(client, dev, today)
+            for dev in load_active(Developer, store=args.store):
+                dev_label = f"developer {dev.name or dev.store_dev_id}"
+                result = run_stage(dev_label, discover_developer_apps, client, dev, today)
+                if result is not None:
+                    new_apps, events = result
                     stats["new_dev_apps"] += new_apps
                     stats["events"] += events
-                    stats["dev_estimate_rows"] += snapshot_developer_estimates(
-                        client, dev, today)
-                except (AuthenticationError, CreditBudgetExhausted):
-                    raise
-                except AppstoreSpyError as exc:
-                    failures.append(f"developer {dev.name or dev.store_dev_id}: {exc}")
-                    log.error("developer %s failed: %s", dev.name, exc)
+                rows = run_stage(f"{dev_label} estimates",
+                                 snapshot_developer_estimates, client, dev, today)
+                stats["dev_estimate_rows"] += rows or 0
 
     except AuthenticationError as exc:
         log.critical("%s", exc)

@@ -5,7 +5,6 @@ plain dicts/lists and returns EventDraft objects, so it is fully unit-testable.
 
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any, Optional
 

@@ -180,6 +180,18 @@ class AppstoreSpyClient:
         cap = min(settings.backoff_max_seconds, settings.backoff_base_seconds * (2 ** attempt))
         return random.uniform(0, cap)  # full jitter (AWS-style)
 
+    @staticmethod
+    def _sleep_before_retry(attempt: int, method: str, path: str, error: str,
+                            retry_after: Optional[str] = None) -> bool:
+        """Back off before the next attempt. False when retries are exhausted."""
+        if attempt >= settings.max_retries:
+            return False
+        delay = AppstoreSpyClient._backoff_delay(attempt, retry_after)
+        log.warning("%s %s %s — retry %d/%d in %.1fs",
+                    method, path, error, attempt + 1, settings.max_retries, delay)
+        time.sleep(delay)
+        return True
+
     def _request(
         self,
         path: str,
@@ -208,11 +220,7 @@ class AppstoreSpyClient:
                 # transient transport problems, all retryable.
                 last_error = f"transport error: {exc.__class__.__name__}: {exc}"
                 self.ledger.record(path, 0, int((time.monotonic() - started) * 1000))
-                if attempt < settings.max_retries:
-                    delay = self._backoff_delay(attempt, None)
-                    log.warning("%s %s %s — retry %d/%d in %.1fs",
-                                method, path, last_error, attempt + 1, settings.max_retries, delay)
-                    time.sleep(delay)
+                if self._sleep_before_retry(attempt, method, path, last_error):
                     continue
                 break
 
@@ -226,11 +234,7 @@ class AppstoreSpyClient:
                     # e.g. an HTML maintenance page from a proxy/CDN with a
                     # 200 status — treat as a transient upstream mangle.
                     last_error = "invalid JSON in 200 response"
-                    if attempt < settings.max_retries:
-                        delay = self._backoff_delay(attempt, None)
-                        log.warning("%s %s %s — retry %d/%d in %.1fs",
-                                    method, path, last_error, attempt + 1, settings.max_retries, delay)
-                        time.sleep(delay)
+                    if self._sleep_before_retry(attempt, method, path, last_error):
                         continue
                     break
             if resp.status_code in (202, 204):
@@ -241,11 +245,8 @@ class AppstoreSpyClient:
                 raise AuthenticationError("API key rejected (HTTP 403). Check APPSTORESPY_API_KEY.")
             if resp.status_code in RETRYABLE_STATUSES:
                 last_error = f"HTTP {resp.status_code}"
-                if attempt < settings.max_retries:
-                    delay = self._backoff_delay(attempt, resp.headers.get("Retry-After"))
-                    log.warning("%s %s %s — retry %d/%d in %.1fs",
-                                method, path, last_error, attempt + 1, settings.max_retries, delay)
-                    time.sleep(delay)
+                if self._sleep_before_retry(attempt, method, path, last_error,
+                                            retry_after=resp.headers.get("Retry-After")):
                     continue
                 break
 

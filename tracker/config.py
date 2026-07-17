@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     play_review_language: str = "en_US"
     reviews_page_size: int = 200  # API max is 1000
     estimates_lookback_days: int = 130   # ~4 months; estimates get revised retroactively
+    estimates_refresh_days: int = 7      # monthly data — weekly pulls are plenty
     installs_lookback_days: int = 180    # first-run backfill window for Play daily installs
     installs_refetch_days: int = 7       # re-pull recent days to pick up corrections
     estimates_batch_size: int = 25       # app ids per /estimates call (comma-separated)

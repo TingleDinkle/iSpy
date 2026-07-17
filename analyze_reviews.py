@@ -16,28 +16,27 @@ Run daily after daily_snapshot.py:
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import logging
 import sys
 from typing import Optional, Sequence
 
 from sqlalchemy import null, select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from tracker import utf8_console
+from tracker.cli import build_parser, init_script
 from tracker.config import settings
-from tracker.db import SessionLocal, session_scope
-from tracker.ingest import insert_event
-from tracker.models import Alert, App, Review
+from tracker.db import SessionLocal, load_active, session_scope
+from tracker.ingest import insert_alert, insert_event
+from tracker.models import App, Review
 from tracker.review_topics import classify, review_weight
 
 log = logging.getLogger("analyze_reviews")
 
 
 def tag_reviews(batch_size: int = 2000) -> int:
-    """Fill Review.topics for every untagged review, in batches. (--retag
-    clears all tags first, so this single NULL-filtered path covers both.)"""
+    """Fill Review.topics for every untagged review. (--retag clears all tags
+    first, so this single NULL-filtered path covers both.) Each batch is one
+    executemany bulk UPDATE by primary key, not a statement per row."""
     tagged = 0
     while True:
         with session_scope() as session:
@@ -46,12 +45,13 @@ def tag_reviews(batch_size: int = 2000) -> int:
                 .where(Review.topics.is_(None))
                 .limit(batch_size)
             ))
-            for review_id, title, comment in rows:
-                text = " ".join(filter(None, [title, comment]))
-                session.execute(
-                    update(Review).where(Review.id == review_id)
-                    .values(topics=classify(text))
-                )
+            if rows:
+                params = [
+                    {"id": review_id,
+                     "topics": classify(" ".join(filter(None, [title, comment])))}
+                    for review_id, title, comment in rows
+                ]
+                session.execute(update(Review), params)
             tagged += len(rows)
         if len(rows) < batch_size:
             break
@@ -91,48 +91,51 @@ def weighted_avg_stars(rows: Sequence[tuple[Optional[int], Optional[int]]]) -> O
     return (total / total_weight) if total_weight > 0 else None
 
 
-def detect_rating_drops(window_days: int, drop_threshold: float,
+def load_review_windows(apps: list[App], window_days: int, today: dt.date
+                        ) -> dict[int, list[tuple]]:
+    """ONE query for every active app's reviews across both analysis windows.
+    Returns app_id -> [(stars, likes, topics, comment, created_at), ...]."""
+    prior_cutoff = today - dt.timedelta(days=2 * window_days)
+    by_app: dict[int, list[tuple]] = {app.id: [] for app in apps}
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Review.app_id, Review.stars, Review.likes, Review.topics,
+                   Review.comment, Review.created_at)
+            .where(Review.app_id.in_(list(by_app)),
+                   Review.created_at.is_not(None),
+                   Review.created_at > dt.datetime.combine(
+                       prior_cutoff, dt.time.max, tzinfo=dt.timezone.utc))
+        )
+        for app_id, stars, likes, topics, comment, created_at in rows:
+            by_app[app_id].append((stars, likes, topics, comment, created_at))
+    return by_app
+
+
+def detect_rating_drops(apps: list[App], reviews_by_app: dict[int, list[tuple]],
+                        window_days: int, drop_threshold: float,
                         min_reviews: int, today: dt.date) -> int:
     """Compare weighted avg stars: last window vs the window before it."""
     created = 0
-    prior_cutoff = today - dt.timedelta(days=2 * window_days)
-
-    with SessionLocal() as session:
-        apps = list(session.execute(select(App).where(App.is_active.is_(True))).scalars())
-
     for app in apps:
-        with session_scope() as session:
-            rows = list(session.execute(
-                select(Review.stars, Review.likes, Review.created_at)
-                .where(Review.app_id == app.id,
-                       Review.created_at.is_not(None),
-                       Review.created_at > dt.datetime.combine(
-                           prior_cutoff, dt.time.max, tzinfo=dt.timezone.utc))
-            ))
-            buckets = {"recent": [], "prior": []}
-            for s, l, created_at in rows:
-                bucket = bucket_for(created_at, today, window_days)
-                if bucket:
-                    buckets[bucket].append((s, l))
-            recent, prior = buckets["recent"], buckets["prior"]
-            if len(recent) < min_reviews or len(prior) < min_reviews:
-                continue
-            recent_avg = weighted_avg_stars(recent)
-            prior_avg = weighted_avg_stars(prior)
-            if recent_avg is None or prior_avg is None:
-                continue
-            if (prior_avg - recent_avg) >= drop_threshold:
-                pct = (recent_avg - prior_avg) / prior_avg * 100.0
-                stmt = pg_insert(Alert).values(
-                    app_id=app.id, metric="rating", alert_date=today,
-                    value=round(recent_avg, 2), baseline=round(prior_avg, 2),
-                    pct_change=round(pct, 2), window_days=window_days,
-                )
-                result = session.execute(
-                    stmt.on_conflict_do_nothing(constraint="uq_alerts_app_metric_date")
-                    .returning(Alert.id)  # rowcount unreliable under psycopg3
-                )
-                if result.first() is not None:
+        buckets: dict[str, list] = {"recent": [], "prior": []}
+        for stars, likes, _topics, _comment, created_at in reviews_by_app.get(app.id, []):
+            bucket = bucket_for(created_at, today, window_days)
+            if bucket:
+                buckets[bucket].append((stars, likes))
+        recent, prior = buckets["recent"], buckets["prior"]
+        if len(recent) < min_reviews or len(prior) < min_reviews:
+            continue
+        recent_avg = weighted_avg_stars(recent)
+        prior_avg = weighted_avg_stars(prior)
+        if recent_avg is None or prior_avg is None:
+            continue
+        if (prior_avg - recent_avg) >= drop_threshold:
+            pct = (recent_avg - prior_avg) / prior_avg * 100.0
+            with session_scope() as session:
+                if insert_alert(session, app_id=app.id, metric="rating",
+                                alert_date=today, value=recent_avg,
+                                baseline=prior_avg, pct_change=pct,
+                                window_days=window_days):
                     created += 1
                     log.info("rating drop: %s %.2f -> %.2f stars (%d recent reviews)",
                              app.name or app.store_app_id, prior_avg, recent_avg,
@@ -140,45 +143,35 @@ def detect_rating_drops(window_days: int, drop_threshold: float,
     return created
 
 
-def detect_topic_surges(window_days: int, today: dt.date) -> int:
+def detect_topic_surges(apps: list[App], reviews_by_app: dict[int, list[tuple]],
+                        window_days: int, today: dt.date) -> int:
     """Flag topics whose mention count jumped vs the prior window."""
     created = 0
-    prior_cutoff = today - dt.timedelta(days=2 * window_days)
-
-    with SessionLocal() as session:
-        apps = list(session.execute(select(App).where(App.is_active.is_(True))).scalars())
-
     for app in apps:
-        with session_scope() as session:
-            rows = list(session.execute(
-                select(Review.topics, Review.created_at, Review.comment)
-                .where(Review.app_id == app.id,
-                       Review.topics.is_not(None),
-                       Review.created_at.is_not(None),
-                       Review.created_at > dt.datetime.combine(
-                           prior_cutoff, dt.time.max, tzinfo=dt.timezone.utc))
-            ))
-            recent_counts: dict[str, int] = {}
-            prior_counts: dict[str, int] = {}
-            samples: dict[str, list[str]] = {}
-            for topics, created_at, comment in rows:
-                which = bucket_for(created_at, today, window_days)
-                if which is None:
-                    continue
-                bucket = recent_counts if which == "recent" else prior_counts
-                for topic in topics or []:
-                    if topic == "praise":
-                        continue  # surges of praise are lovely but not actionable
-                    bucket[topic] = bucket.get(topic, 0) + 1
-                    if bucket is recent_counts and comment:
-                        samples.setdefault(topic, [])
-                        if len(samples[topic]) < 3:
-                            samples[topic].append(comment[:200])
+        recent_counts: dict[str, int] = {}
+        prior_counts: dict[str, int] = {}
+        samples: dict[str, list[str]] = {}
+        for stars, likes, topics, comment, created_at in reviews_by_app.get(app.id, []):
+            if not topics:
+                continue
+            which = bucket_for(created_at, today, window_days)
+            if which is None:
+                continue
+            bucket = recent_counts if which == "recent" else prior_counts
+            for topic in topics:
+                if topic == "praise":
+                    continue  # surges of praise are lovely but not actionable
+                bucket[topic] = bucket.get(topic, 0) + 1
+                if bucket is recent_counts and comment:
+                    samples.setdefault(topic, [])
+                    if len(samples[topic]) < 3:
+                        samples[topic].append(comment[:200])
 
-            name = app.name or app.store_app_id
-            for topic, count in recent_counts.items():
-                prior = prior_counts.get(topic, 0)
-                if count >= settings.topic_surge_min and count >= settings.topic_surge_ratio * max(prior, 1):
+        name = app.name or app.store_app_id
+        for topic, count in recent_counts.items():
+            prior = prior_counts.get(topic, 0)
+            if count >= settings.topic_surge_min and count >= settings.topic_surge_ratio * max(prior, 1):
+                with session_scope() as session:
                     inserted = insert_event(
                         session,
                         event_type="review_topic_surge",
@@ -190,16 +183,16 @@ def detect_topic_surges(window_days: int, today: dt.date) -> int:
                         dedupe_key=f"review_topic_surge|{app.id}|{topic}|{today}",
                         app_id=app.id, store=app.store, store_app_id=app.store_app_id,
                     )
-                    if inserted:
-                        created += 1
-                        log.info("topic surge: %s / %s (%d vs %d)", name, topic, count, prior)
+                if inserted:
+                    created += 1
+                    log.info("topic surge: %s / %s (%d vs %d)", name, topic, count, prior)
     return created
 
 
 def print_report(window_days: int, today: dt.date) -> None:
     start = today - dt.timedelta(days=window_days)
+    apps = load_active(App)
     with SessionLocal() as session:
-        apps = list(session.execute(select(App).where(App.is_active.is_(True))).scalars())
         print(f"\nReview topics, last {window_days} days (since {start}):\n")
         for app in apps:
             rows = list(session.execute(
@@ -225,9 +218,7 @@ def print_report(window_days: int, today: dt.date) -> None:
 
 
 def main() -> int:
-    utf8_console()
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = build_parser(__doc__)
     parser.add_argument("--window", type=int, default=7, help="days (default 7)")
     parser.add_argument("--drop", type=float, default=settings.rating_drop_stars,
                         help="star drop that triggers an alert (default %(default)s)")
@@ -236,13 +227,8 @@ def main() -> int:
                         help="re-tag ALL reviews (after editing TOPICS)")
     parser.add_argument("--report", action="store_true",
                         help="print per-app topic breakdown and exit")
-    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    init_script(args)
     today = dt.datetime.now(dt.timezone.utc).date()
 
     if args.report:
@@ -258,8 +244,11 @@ def main() -> int:
         log.info("Cleared existing tags for retag")
 
     tagged = tag_reviews()
-    drops = detect_rating_drops(args.window, args.drop, args.min_reviews, today)
-    surges = detect_topic_surges(args.window, today)
+    apps = load_active(App)
+    reviews_by_app = load_review_windows(apps, args.window, today)
+    drops = detect_rating_drops(apps, reviews_by_app, args.window, args.drop,
+                                args.min_reviews, today)
+    surges = detect_topic_surges(apps, reviews_by_app, args.window, today)
     log.info("Done: tagged=%d rating_alerts=%d topic_surges=%d", tagged, drops, surges)
     return 0
 

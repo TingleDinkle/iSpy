@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from .models import (
+    Alert,
     App,
     AppEvent,
     AppSnapshot,
@@ -93,62 +94,71 @@ def upsert_snapshot(
     )
 
 
+def _batched_upsert(session: Session, model, constraint: str,
+                    deduped: dict[tuple, dict[str, Any]],
+                    update_cols: list[str], chunk_size: int = 500) -> int:
+    """Chunked multi-row INSERT ... ON CONFLICT DO UPDATE. Values must already
+    be deduped on the unique key — Postgres rejects a statement that updates
+    the same row twice."""
+    values = list(deduped.values())
+    for i in range(0, len(values), chunk_size):
+        chunk = values[i : i + chunk_size]
+        stmt = pg_insert(model).values(chunk)
+        session.execute(stmt.on_conflict_do_update(
+            constraint=constraint,
+            set_={c: stmt.excluded[c] for c in update_cols},
+        ))
+    return len(values)
+
+
+def _parse_month(value: Any) -> Optional[dt.date]:
+    try:
+        return dt.datetime.strptime(value, "%Y-%m").date()
+    except (TypeError, ValueError):
+        return None
+
+
 def upsert_monthly_estimates(
     session: Session,
     app_id_by_store_key: dict[str, int],
     rows: list[dict[str, Any]],
 ) -> int:
-    """Upsert /estimates rows. ``month`` arrives as 'YYYY-MM'."""
-    written = 0
+    """Upsert /estimates rows (one batched statement per 500 rows).
+    ``month`` arrives as 'YYYY-MM'. fetched_at advances on conflict so the
+    weekly refresh gate in daily_snapshot can see when data was last pulled."""
+    deduped: dict[tuple, dict[str, Any]] = {}
     for row in rows:
         internal_id = app_id_by_store_key.get(str(row.get("id")))
         if internal_id is None:
             log.warning("Estimates row for untracked app id %r — skipped", row.get("id"))
             continue
-        try:
-            month = dt.datetime.strptime(row["month"], "%Y-%m").date()
-        except (KeyError, ValueError):
+        month = _parse_month(row.get("month"))
+        if month is None:
             log.warning("Estimates row with bad month %r — skipped", row.get("month"))
             continue
-        stmt = pg_insert(MonthlyEstimate).values(
-            app_id=internal_id,
-            month=month,
-            revenue=row.get("revenue"),
-            downloads=row.get("downloads"),
-        )
-        session.execute(
-            stmt.on_conflict_do_update(
-                constraint="uq_estimates_app_month",
-                set_={"revenue": stmt.excluded.revenue, "downloads": stmt.excluded.downloads},
-            )
-        )
-        written += 1
-    return written
+        deduped[(internal_id, month)] = {
+            "app_id": internal_id, "month": month,
+            "revenue": row.get("revenue"), "downloads": row.get("downloads"),
+            "fetched_at": func.now(),
+        }
+    return _batched_upsert(session, MonthlyEstimate, "uq_estimates_app_month",
+                           deduped, ["revenue", "downloads", "fetched_at"])
 
 
 def upsert_daily_installs(session: Session, app: App, rows: list[dict[str, Any]]) -> int:
-    written = 0
+    deduped: dict[tuple, dict[str, Any]] = {}
     for row in rows:
         try:
             day = dt.date.fromisoformat(row["date"])
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             log.warning("installs_daily row with bad date %r — skipped", row.get("date"))
             continue
-        stmt = pg_insert(DailyInstalls).values(
-            app_id=app.id,
-            date=day,
-            ipd=row.get("ipd"),
-            installs_cumulative=row.get("installs"),
-        )
-        session.execute(
-            stmt.on_conflict_do_update(
-                constraint="uq_installs_app_date",
-                set_={"ipd": stmt.excluded.ipd,
-                      "installs_cumulative": stmt.excluded.installs_cumulative},
-            )
-        )
-        written += 1
-    return written
+        deduped[(app.id, day)] = {
+            "app_id": app.id, "date": day,
+            "ipd": row.get("ipd"), "installs_cumulative": row.get("installs"),
+        }
+    return _batched_upsert(session, DailyInstalls, "uq_installs_app_date",
+                           deduped, ["ipd", "installs_cumulative"])
 
 
 def upsert_rankings(session: Session, store: str, rows: list[dict[str, Any]]) -> int:
@@ -179,16 +189,7 @@ def upsert_rankings(session: Session, store: str, rows: list[dict[str, Any]]) ->
             "collection": row.get("collection"),
             "rank": int(rank),
         }
-    values = list(deduped.values())
-    for i in range(0, len(values), 500):
-        chunk = values[i : i + 500]
-        stmt = pg_insert(Ranking).values(chunk)
-        session.execute(
-            stmt.on_conflict_do_update(
-                constraint="uq_rankings_slot", set_={"rank": stmt.excluded.rank}
-            )
-        )
-    return len(values)
+    return _batched_upsert(session, Ranking, "uq_rankings_slot", deduped, ["rank"])
 
 
 def sync_developer_apps(
@@ -239,29 +240,19 @@ def upsert_developer_estimates(
     session: Session, developer: Developer, rows: list[dict[str, Any]]
 ) -> int:
     """Upsert studio-level monthly estimates. ``month`` arrives as 'YYYY-MM'."""
-    written = 0
+    deduped: dict[tuple, dict[str, Any]] = {}
     for row in rows:
-        try:
-            month = dt.datetime.strptime(row["month"], "%Y-%m").date()
-        except (KeyError, TypeError, ValueError):
+        month = _parse_month(row.get("month"))
+        if month is None:
             log.warning("Developer estimate with bad month %r — skipped", row.get("month"))
             continue
-        stmt = pg_insert(DeveloperEstimate).values(
-            developer_id=developer.id,
-            month=month,
-            revenue=row.get("revenue"),
-            downloads=row.get("downloads"),
-        )
-        session.execute(
-            stmt.on_conflict_do_update(
-                constraint="uq_dev_estimates",
-                set_={"revenue": stmt.excluded.revenue,
-                      "downloads": stmt.excluded.downloads,
-                      "fetched_at": func.now()},
-            )
-        )
-        written += 1
-    return written
+        deduped[(developer.id, month)] = {
+            "developer_id": developer.id, "month": month,
+            "revenue": row.get("revenue"), "downloads": row.get("downloads"),
+            "fetched_at": func.now(),
+        }
+    return _batched_upsert(session, DeveloperEstimate, "uq_dev_estimates",
+                           deduped, ["revenue", "downloads", "fetched_at"])
 
 
 def insert_event(
@@ -316,30 +307,52 @@ def upsert_market_snapshot(
 
 
 def insert_reviews(session: Session, app: App, rows: list[dict[str, Any]]) -> int:
-    """Append-only: existing (app, store_review_id) rows are left untouched."""
-    inserted = 0
+    """Append-only: existing (app, store_review_id) rows are left untouched.
+    One batched statement per 500 rows; RETURNING counts the actual inserts
+    (rowcount is -1 under psycopg3 and cannot be trusted)."""
+    deduped: dict[str, dict[str, Any]] = {}
     for row in rows:
         review_id = row.get("id")
         if not review_id:
             continue
-        stmt = pg_insert(Review).values(
-            app_id=app.id,
-            store_review_id=str(review_id),
-            stars=row.get("stars"),
-            title=row.get("title"),
-            comment=row.get("comment"),
-            author_name=row.get("author_name") or row.get("user_name"),
-            country=row.get("country"),
-            lang=row.get("lang"),
-            app_version=row.get("version"),
-            likes=row.get("likes"),
-            created_at=_parse_created(row.get("created")),
-            raw=row,
-        )
+        deduped[str(review_id)] = {
+            "app_id": app.id,
+            "store_review_id": str(review_id),
+            "stars": row.get("stars"),
+            "title": row.get("title"),
+            "comment": row.get("comment"),
+            "author_name": row.get("author_name") or row.get("user_name"),
+            "country": row.get("country"),
+            "lang": row.get("lang"),
+            "app_version": row.get("version"),
+            "likes": row.get("likes"),
+            "created_at": _parse_created(row.get("created")),
+            "raw": row,
+        }
+    values = list(deduped.values())
+    inserted = 0
+    for i in range(0, len(values), 500):
+        stmt = pg_insert(Review).values(values[i : i + 500])
         result = session.execute(
             stmt.on_conflict_do_nothing(constraint="uq_reviews_app_review")
-            .returning(Review.id)  # rowcount is -1 under psycopg3 — count RETURNING rows
+            .returning(Review.id)
         )
-        if result.first() is not None:
-            inserted += 1
+        inserted += len(result.fetchall())
     return inserted
+
+
+def insert_alert(session: Session, *, app_id: int, metric: str, alert_date: dt.date,
+                 value: float, baseline: float, pct_change: float,
+                 window_days: int) -> bool:
+    """Insert a metric alert; True if new, False if already recorded for that
+    (app, metric, day). Values are rounded to 2 decimals for the Numeric cols."""
+    stmt = pg_insert(Alert).values(
+        app_id=app_id, metric=metric, alert_date=alert_date,
+        value=round(value, 2), baseline=round(baseline, 2),
+        pct_change=round(pct_change, 2), window_days=window_days,
+    )
+    result = session.execute(
+        stmt.on_conflict_do_nothing(constraint="uq_alerts_app_metric_date")
+        .returning(Alert.id)
+    )
+    return result.first() is not None
