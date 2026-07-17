@@ -344,8 +344,8 @@ def main() -> int:
         log.error("Nothing to do. Add apps: python manage.py add-app <store> <id>")
         return 1
 
-    log.info("Snapshotting %d app(s) for %s (%d watch-tier not due yet)",
-             len(apps), today, skipped_watch)
+    log.info("Snapshotting %d app(s) for %s (%d skipped: watch-tier not due "
+             "or already collected today)", len(apps), today, skipped_watch)
     client = AppstoreSpyClient()
     failures: list[str] = []
     stats = {"snapshots": 0, "estimate_rows": 0, "install_rows": 0,
